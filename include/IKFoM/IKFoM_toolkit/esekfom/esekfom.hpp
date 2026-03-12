@@ -59,8 +59,7 @@ namespace esekfom {
 using namespace Eigen;
 
 template<typename T>
-struct dyn_share_modified
-{
+struct dyn_share_modified {
 	bool valid;
 	bool converge;
 	T M_Noise;
@@ -71,22 +70,20 @@ struct dyn_share_modified
 	bool satu_check[6];
 };
 
-template<typename state, int process_noise_dof, typename input = state, typename measurement=state, int measurement_noise_dof=0>
+template<typename state, int process_noise_dof, typename input = state, typename measurement=state,
+		 int measurement_noise_dof=0>
 class esekf{
-
 	typedef esekf self;
-	enum{
-		n = state::DOF, m = state::DIM, l = measurement::DOF
-	};
+	enum{ n = state::DOF, m = state::DIM, l = measurement::DOF };
 
 public:
-	
 	typedef typename state::scalar scalar_type;
 	typedef Matrix<scalar_type, n, n> cov;
 	typedef Matrix<scalar_type, m, n> cov_;
 	typedef SparseMatrix<scalar_type> spMt;
 	typedef Matrix<scalar_type, n, 1> vectorized_state;
 	typedef Matrix<scalar_type, m, 1> flatted_state;
+
 	typedef flatted_state processModel(state &, const input &);
 	typedef Eigen::Matrix<scalar_type, m, n> processMatrix1(state &, const input &);
 	typedef Eigen::Matrix<scalar_type, m, process_noise_dof> processMatrix2(state &, const input &);
@@ -94,6 +91,7 @@ public:
 
 	typedef void measurementModel_dyn_share_modified_cov(state &, Eigen::Matrix3d, Eigen::Matrix3d, dyn_share_modified<scalar_type> &);
 	typedef void measurementModel_dyn_share_modified(state &, dyn_share_modified<scalar_type> &);
+
 	typedef Eigen::Matrix<scalar_type ,l, n> measurementMatrix1(state &);
 	typedef Eigen::Matrix<scalar_type , Eigen::Dynamic, n> measurementMatrix1_dyn(state &);
 	typedef Eigen::Matrix<scalar_type ,l, measurement_noise_dof> measurementMatrix2(state &);
@@ -101,11 +99,10 @@ public:
 	typedef Eigen::Matrix<scalar_type, measurement_noise_dof, measurement_noise_dof> measurementnoisecovariance;
 	typedef Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> measurementnoisecovariance_dyn;
 
-	esekf(const state &x = state(),
-		const cov  &P = cov::Identity()): x_(x), P_(P){};
+	esekf(const state &x = state(), const cov  &P = cov::Identity()): x_(x), P_(P){};
 
-	void init_dyn_share_modified_2h(processModel f_in, processMatrix1 f_x_in, measurementModel_dyn_share_modified_cov h_dyn_share_in1)
-	{
+	void init_dyn_share_modified_2h(processModel f_in, processMatrix1 f_x_in,
+									measurementModel_dyn_share_modified_cov h_dyn_share_in1) {
 		f = f_in;
 		f_x = f_x_in;
 		// f_w = f_w_in;
@@ -118,8 +115,9 @@ public:
 		x_.build_SEN_state();
 	}
 	
-	void init_dyn_share_modified_3h(processModel f_in, processMatrix1 f_x_in, measurementModel_dyn_share_modified_cov h_dyn_share_in1, measurementModel_dyn_share_modified h_dyn_share_in2)
-	{
+	void init_dyn_share_modified_3h(processModel f_in, processMatrix1 f_x_in,
+									measurementModel_dyn_share_modified_cov h_dyn_share_in1,
+									measurementModel_dyn_share_modified h_dyn_share_in2) {
 		f = f_in;
 		f_x = f_x_in;
 		// f_w = f_w_in;
@@ -134,28 +132,26 @@ public:
 	}
 
 	// iterated error state EKF propogation
-	void predict(double &dt, processnoisecovariance &Q, const input &i_in, bool predict_state, bool prop_cov){
-		if (predict_state)
-		{
+	void predict(double &dt, processnoisecovariance &Q, const input &i_in, bool predict_state, bool prop_cov) {
+		if (predict_state) {
 			flatted_state f_ = f(x_, i_in);
 			x_.oplus(f_, dt);
 		}
 
-		if (prop_cov)
-		{
+		if (prop_cov) {
 			flatted_state f_ = f(x_, i_in);
-			// state x_before = x_;
-
 			cov_ f_x_ = f_x(x_, i_in);
 			cov f_x_final;
 			F_x1 = cov::Identity();
-			for (std::vector<std::pair<std::pair<int, int>, int> >::iterator it = x_.vect_state.begin(); it != x_.vect_state.end(); it++) {
+			for (std::vector<std::pair<std::pair<int, int>, int> >::iterator it = x_.vect_state.begin();
+				 it != x_.vect_state.end(); it++) {
 				int idx = (*it).first.first;
 				int dim = (*it).first.second;
 				int dof = (*it).second;
 				for(int i = 0; i < n; i++){
-					for(int j=0; j<dof; j++)
-					{f_x_final(idx+j, i) = f_x_(dim+j, i);}	
+					for(int j=0; j<dof; j++) {
+						f_x_final(idx+j, i) = f_x_(dim+j, i);
+					}	
 				}
 			}
 
@@ -240,10 +236,8 @@ public:
 	}
 	
 	void update_iterated_dyn_share_IMU() {
-		
 		dyn_share_modified<scalar_type> dyn_share;
-		for(int i=0; i<maximum_iter; i++)
-		{
+		for(int i=0; i<maximum_iter; i++) {
 			dyn_share.valid = true;
 			h_dyn_share_modified_2(x_, dyn_share);
 
@@ -255,18 +249,14 @@ public:
 			PHT.setZero();
 			HP.setZero();
 			HPHT.setZero();
-			for (int l_ = 0; l_ < 6; l_++)
-			{
-				if (!dyn_share.satu_check[l_])
-				{
+			for (int l_ = 0; l_ < 6; l_++) {
+				if (!dyn_share.satu_check[l_]) {
 					PHT.col(l_) = P_.col(15+l_) + P_.col(24+l_);
 					HP.row(l_) = P_.row(15+l_) + P_.row(24+l_);
 				}
 			}
-			for (int l_ = 0; l_ < 6; l_++)
-			{
-				if (!dyn_share.satu_check[l_])
-				{
+			for (int l_ = 0; l_ < 6; l_++) {
+				if (!dyn_share.satu_check[l_]) {
 					HPHT.col(l_) = HP.col(15+l_) + HP.col(24+l_);
 				}
 				HPHT(l_, l_) += dyn_share.R_IMU(l_); //, l);
@@ -281,12 +271,10 @@ public:
 		return;
 	}
 	
-	void change_x(state &input_state)
-	{
+	void change_x(state &input_state) {
 		x_ = input_state;
-
-		if((!x_.vect_state.size())&&(!x_.SO3_state.size())&&(!x_.S2_state.size())&&(!x_.SEN_state.size()))
-		{
+		if((!x_.vect_state.size()) && (!x_.SO3_state.size()) &&
+		   (!x_.S2_state.size()) && (!x_.SEN_state.size())) {
 			x_.build_S2_state();
 			x_.build_SO3_state();
 			x_.build_vect_state();
@@ -294,19 +282,16 @@ public:
 		}
 	}
 
-	void change_P(cov &input_cov)
-	{
-		P_ = input_cov;
-	}
+	void change_P(cov &input_cov) { P_ = input_cov; }
 
-	const state& get_x() const {
-		return x_;
-	}
-	const cov& get_P() const {
-		return P_;
-	}
+	const state& get_x() const { return x_; }
+
+	const cov& get_P() const { return P_; }
+
+public:
 	cov P_;
 	state x_;
+	
 private:
 	measurement m_;
 	spMt l_;
@@ -329,7 +314,6 @@ private:
 	measurementModel_dyn_share_modified_cov *h_dyn_share_modified_1;
 
 	measurementModel_dyn_share_modified *h_dyn_share_modified_2;
-
 	measurementModel_dyn_share_modified *h_dyn_share_modified_3;
 
 	int maximum_iter = 0;

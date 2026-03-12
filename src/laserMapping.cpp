@@ -196,8 +196,7 @@ void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body) {
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
 
     for (int i = 0; i < size; i++) {
-        pointBodyLidarToIMU(&feats_undistort->points[i], \
-                            &laserCloudIMUBody->points[i]);
+        pointBodyLidarToIMU(&feats_undistort->points[i], &laserCloudIMUBody->points[i]);
     }
 
     sensor_msgs::PointCloud2 laserCloudmsg;
@@ -246,8 +245,8 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped) {
     static tf::TransformBroadcaster br;
     tf::Transform                   transform;
     tf::Quaternion                  q;
-    transform.setOrigin(tf::Vector3(odomAftMapped.pose.pose.position.x, \
-                                    odomAftMapped.pose.pose.position.y, \
+    transform.setOrigin(tf::Vector3(odomAftMapped.pose.pose.position.x,
+                                    odomAftMapped.pose.pose.position.y,
                                     odomAftMapped.pose.pose.position.z));
     q.setW(odomAftMapped.pose.pose.orientation.w);
     q.setX(odomAftMapped.pose.pose.orientation.x);
@@ -310,7 +309,7 @@ int main(int argc, char** argv) {
     reset_cov(P_init);
     kf_input.change_P(P_init);
     Eigen::Matrix<double, 24, 24> Q_input = process_noise_cov_input();
-    
+
     kf_output.init_dyn_share_modified_3h(get_f_output, df_dx_output, h_model_output, h_model_IMU_output);
     Eigen::Matrix<double, 30, 30> P_init_output; // = MD(24, 24)::Identity() * 0.01;
     reset_cov_output(P_init_output);
@@ -385,7 +384,7 @@ int main(int argc, char** argv) {
                     kf_output.x_.gravity << VEC_FROM_ARRAY(gravity);
                     // kf_output.x_.acc << VEC_FROM_ARRAY(gravity);
                     // kf_output.x_.acc *= -1;
-                    
+
                     while (Measures.lidar_beg_time > imu_next.header.stamp.toSec()) // if it is needed for the new map?
                     {
                         imu_deque.pop_front();
@@ -669,7 +668,7 @@ int main(int argc, char** argv) {
 
                             if (!is_first_frame) {
                                 double dt = time_current - time_predict_last_const;
-                            
+
                                 double dt_cov = time_current - time_update_last;
                                 if (dt_cov > 0.0) {
                                     kf_output.predict(dt_cov, Q_output, input_in, false, true);
