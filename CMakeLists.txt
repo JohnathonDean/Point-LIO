@@ -85,11 +85,8 @@ catkin_package(
   INCLUDE_DIRS
 )
 
-add_executable(pointlio_mapping src/laserMapping.cpp 
-                src/li_initialization.cpp src/parameters.cpp src/preprocess.cpp src/Estimator.cpp 
+add_executable(pointlio_mapping src/runMapping.cpp src/laserMapping.cpp
+                src/parameters.cpp src/preprocess.cpp
                 src/IMU_Processing.cpp)
 target_link_libraries(pointlio_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES})
 target_include_directories(pointlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
-
-
-
