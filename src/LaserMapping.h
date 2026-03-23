@@ -89,9 +89,9 @@ class LaserMapping {
     );
     void h_model_IMU_output(state_output& s, esekfom::dyn_share_modified<double>& ekfom_data);
 
+  private:
     IVoxType::Options ivox_options_;
     std::shared_ptr<IVoxType> ivox_;
-
     std::shared_ptr<ImuProcess> p_imu;
     std::shared_ptr<Preprocess> p_pre;
 
@@ -103,7 +103,6 @@ class LaserMapping {
     ros::Publisher pub_laser_cloud_map_;
     ros::Publisher pub_odom_aft_mapped_;
     ros::Publisher pub_path_;
-
     nav_msgs::Path path_;
     nav_msgs::Odometry odom_aft_mapped_;
     geometry_msgs::PoseStamped msg_body_pose_;
@@ -112,61 +111,71 @@ class LaserMapping {
     std::deque<PointCloudXYZI::Ptr>  lidar_buffer;
     std::deque<double>               time_buffer;
     std::deque<sensor_msgs::Imu::Ptr> imu_deque;
-
     double last_timestamp_lidar = -1.0;
-    double lidar_end_time = 0.0;
     int scan_count = 0;
     bool cut_frame_init = false; // true;
     int frame_ct = 0;
     double time_con = 0.0;
     PointCloudXYZI::Ptr ptr_con = PointCloudXYZI::Ptr(new PointCloudXYZI());
-
     double last_timestamp_imu = -1.0;
     double timediff_imu_wrt_lidar = 0.0;
     double time_lag_IMU_wtr_lidar = 0.0;
 
+    // 同步后的当前处理组数据
+    MeasureGroup meas;
+    double lidar_end_time = 0.0;
+    bool lose_lid = false;
     bool lidar_pushed = false;
     bool imu_pushed = false;
+    sensor_msgs::Imu imu_last;
+    sensor_msgs::Imu imu_next;
+    double gravity_norm = 9.81;
+
+    bool flg_first_scan = true;
+    double first_lidar_time = 0.0;
+    double first_imu_time = -1.0;
+    double time_current = 0.0;
+    std::vector<int> time_seq;
+    bool is_first_frame = true;
+    double time_update_last = 0.0;
+    double time_predict_last_const = 0.0;
+    double t_last = 0.0;
     
+
     // 降采样滤波器对象。
     pcl::VoxelGrid<PointType> down_size_filter_surf;
     pcl::VoxelGrid<PointType> down_size_filter_map;
-
     // 点云与发布缓存。
     PointCloudXYZI::Ptr feats_undistort = PointCloudXYZI::Ptr(new PointCloudXYZI());
     PointCloudXYZI::Ptr feats_down_body = PointCloudXYZI::Ptr(new PointCloudXYZI());
+    std::size_t feats_down_size = 0;
+    
+    bool init_map = false;
     PointCloudXYZI::Ptr feats_down_world = PointCloudXYZI::Ptr(new PointCloudXYZI());
     PointCloudXYZI::Ptr init_feats_world = PointCloudXYZI::Ptr(new PointCloudXYZI());
-    bool init_map = false;
+
     PointCloudXYZI::Ptr normvec = PointCloudXYZI::Ptr(new PointCloudXYZI());
     std::vector<PointVector> nearest_points;
     std::vector<M3D> crossmat_list;
     std::vector<V3D> pbody_list;
-    std::vector<bool> point_selected_surf;
-    std::vector<int> time_seq;
-    std::size_t feats_down_size = 0;
+    bool point_selected_surf[100000] = {0};
+    int time_k = 0;
+    int h_idx = -1;
     int effct_feat_num = 0;
 
     // EKF 初始化矩阵、过程噪声、运行期状态与配套缓存。
     esekfom::esekf<state_input, 24, input_ikfom> kf_input;
+    Eigen::Matrix<double, 24, 24> Q_input;
+    input_ikfom input_in;
+    
     esekfom::esekf<state_output, 30, input_ikfom> kf_output;
     Eigen::Matrix<double, 30, 30> Q_output;
-    Eigen::Matrix<double, 24, 24> Q_input;
-
-    sensor_msgs::Imu imu_last;
-    sensor_msgs::Imu imu_next;
-    MeasureGroup meas;
     V3D angvel_avr = V3D::Zero();
     V3D acc_avr = V3D::Zero();
-    double gravity_norm = 9.81;
-    double time_update_last = 0.0;
-    double time_predict_last_const = 0.0;
-    double t_last = 0.0;
-    bool first_output_update = true;
-    bool first_input_update = true;
 
 
-private:
+
+/* -------------------------------------------------------------------------------------- */
     // 通过 ROS 参数服务器加载配置项
     int lidar_type;
     std::string lid_topic;
@@ -179,6 +188,7 @@ private:
     int  init_map_size = 10;
     bool use_imu_as_input = false;
     bool check_satu = true;
+    bool prop_at_freq_of_imu = true;
     bool extrinsic_est_en = true;
     bool imu_en = true;
     bool space_down_sample = true;
@@ -200,13 +210,14 @@ private:
     double acc_cov_output;
     double imu_meas_omg_cov = 0.1;
     double imu_meas_acc_cov = 0.1;
-    double lidar_time_inte = 0.1;
     double satu_acc = 3.0;
     double satu_gyro = 35.0;
     double acc_norm = 1.0;
+    
+    double lidar_time_inte = 0.1;
+    double laser_point_cov = 0.001;
     double plane_thr = 0.1;
     double match_s = 81.0;
-    double laser_point_cov = 0.001;
 
     bool publish_odometry_without_downsample;
     bool path_en;
@@ -215,11 +226,6 @@ private:
     bool pcd_save_en = false;
 
 
-    bool lose_lid = false;
-    bool flg_first_scan = true;
-    double first_lidar_time = 0.0;
-    double first_imu_time = -1.0;
-    double time_current = 0.0;
 
 
 

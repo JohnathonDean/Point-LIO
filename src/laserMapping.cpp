@@ -20,6 +20,8 @@ void LaserMapping::InitROS(ros::NodeHandle &nh) {
 
     ivox_ = std::make_shared<IVoxType>(ivox_options_);
 
+    memset(point_selected_surf, true, sizeof(point_selected_surf));
+
     kf_output.x_.offset_R_L_I = Lidar_R_wrt_IMU;
     kf_output.x_.offset_T_L_I = Lidar_T_wrt_IMU;
     kf_output.init_dyn_share_modified_3h(
@@ -59,6 +61,7 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     
     nh.param<bool>("use_imu_as_input", use_imu_as_input, 0);
     nh.param<bool>("check_satu", check_satu, true);
+    nh.param<bool>("prop_at_freq_of_imu", prop_at_freq_of_imu, 1);
 
     nh.param<int>("preprocess/lidar_type", lidar_type, 1);
     nh.param<int>("point_filter_num", point_filter_num, 2);
@@ -92,10 +95,10 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     nh.param<double>("mapping/satu_acc", satu_acc, 3.0);
     nh.param<double>("mapping/satu_gyro", satu_gyro, 35.0);
 
-    nh.param<double>("mapping/lidar_time_inte", lidar_time_inte, 0.1);
+    nh.param<double>("mapping/lidar_time_inte",lidar_time_inte,0.1);
+    nh.param<double>("mapping/lidar_meas_cov",laser_point_cov,0.1);
     nh.param<double>("mapping/plane_thr", plane_thr, 0.1);
     nh.param<double>("mapping/match_s", match_s, 81.0);
-    nh.param<double>("mapping/laser_point_cov", laser_point_cov, 0.001);
 
     nh.param<bool>("odometry/publish_odometry_without_downsample", publish_odometry_without_downsample, false);
     nh.param<bool>("publish/path_en",path_en, true);
@@ -248,12 +251,11 @@ void LaserMapping::Run() {
         nearest_points.resize(feats_down_size);
         crossmat_list.resize(feats_down_size);
         pbody_list.resize(feats_down_size);
-        point_selected_surf.assign(feats_down_size, false);
 
         for (size_t i = 0; i < feats_down_body->size(); i++) {
-            V3D point_this(
-                feats_down_body->points[i].x, feats_down_body->points[i].y, feats_down_body->points[i].z
-            );
+            V3D point_this(feats_down_body->points[i].x,
+                           feats_down_body->points[i].y,
+                           feats_down_body->points[i].z);
             pbody_list[i] = point_this;
             if (!extrinsic_est_en) {
                 point_this = Lidar_R_wrt_IMU * point_this + Lidar_T_wrt_IMU;
@@ -264,118 +266,294 @@ void LaserMapping::Run() {
         }
 
         if (!use_imu_as_input) {
-            input_ikfom input_in;
-            time_current = meas.lidar_last_time;
+            bool imu_upda_cov = false;
+            effct_feat_num = 0;
+            if (time_seq.size() > 0) {
+                double pcl_beg_time = meas.lidar_beg_time;
+                h_idx = -1;
+                for (time_k = 0; time_k < time_seq.size(); time_k++) {
+                    PointType &point_body = feats_down_body->points[h_idx + time_seq[time_k]];
+                    time_current = point_body.curvature / 1000.0 + pcl_beg_time;
 
-            if (imu_en) {
-                if (first_output_update) {
-                    time_predict_last_const = meas.lidar_beg_time;
-                    time_update_last = meas.lidar_beg_time;
-                    first_output_update = false;
-                }
-
-                while (!imu_deque.empty() && imu_deque.front()->header.stamp.toSec() <= time_current) {
-                    const auto &imu_msg = imu_deque.front();
-                    const double imu_time = imu_msg->header.stamp.toSec();
-                    angvel_avr << imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z;
-                    acc_avr << imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z;
-                    input_in.gyro << angvel_avr(0), angvel_avr(1), angvel_avr(2);
-                    input_in.acc << acc_avr(0), acc_avr(1), acc_avr(2);
-
-                    double dt_state = imu_time - time_predict_last_const;
-                    if (dt_state > 0.0) {
-                        kf_output.predict(dt_state, Q_output, input_in, true, false);
-                        time_predict_last_const = imu_time;
+                    if (is_first_frame) {
+                        if (imu_en) {
+                            while (time_current > imu_next.header.stamp.toSec()) {
+                                imu_deque.pop_front();
+                                if (imu_deque.empty()) break;
+                                imu_last = imu_next;
+                                imu_next = *(imu_deque.front());
+                            }
+                            angvel_avr << imu_last.angular_velocity.x, imu_last.angular_velocity.y, imu_last.angular_velocity.z;
+                            acc_avr << imu_last.linear_acceleration.x, imu_last.linear_acceleration.y, imu_last.linear_acceleration.z;
+                        }
+                        is_first_frame = false;
+                        imu_upda_cov = true;
+                        time_update_last = time_current;
+                        time_predict_last_const = time_current;
                     }
 
-                    double dt_cov = imu_time - time_update_last;
-                    if (dt_cov > 0.0) {
-                        kf_output.predict(dt_cov, Q_output, input_in, false, true);
-                        time_update_last = imu_time;
-                        kf_output.update_iterated_dyn_share_IMU();
+                    if (imu_en && !imu_deque.empty()) {
+                        bool last_imu = imu_next.header.stamp.toSec() == imu_deque.front()->header.stamp.toSec();
+                        while (imu_next.header.stamp.toSec() < time_predict_last_const && !imu_deque.empty()) {
+                            if (!last_imu) {
+                                imu_last = imu_next;
+                                imu_next = *(imu_deque.front());
+                                break;
+                            } else {
+                                imu_deque.pop_front();
+                                if (imu_deque.empty()) break;
+                                imu_last = imu_next;
+                                imu_next = *(imu_deque.front());
+                            }
+                        }
+
+                        bool imu_comes = time_current > imu_next.header.stamp.toSec();
+                        while (imu_comes) {
+                            imu_upda_cov = true;
+                            angvel_avr << imu_next.angular_velocity.x, imu_next.angular_velocity.y, imu_next.angular_velocity.z;
+                            acc_avr << imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z;
+
+                            /*** covariance update ***/
+                            double dt = imu_next.header.stamp.toSec() - time_predict_last_const;
+                            kf_output.predict(dt, Q_output, input_in, true, false);
+                            time_predict_last_const = imu_next.header.stamp.toSec();
+
+                            double dt_cov = imu_next.header.stamp.toSec() - time_update_last;
+                            if (dt_cov > 0.0) {
+                                time_update_last = imu_next.header.stamp.toSec();
+                                kf_output.predict(dt_cov, Q_output, input_in, false, true);
+                                kf_output.update_iterated_dyn_share_IMU();
+                            }
+
+                            imu_deque.pop_front();
+                            if (imu_deque.empty()) break;
+                            imu_last = imu_next;
+                            imu_next = *(imu_deque.front());
+                            imu_comes = time_current > imu_next.header.stamp.toSec();
+                        }
                     }
 
-                    imu_last = *imu_msg;
-                    imu_deque.pop_front();
-                }
-            }
-
-            {
-                input_in.gyro << angvel_avr(0), angvel_avr(1), angvel_avr(2);
-                input_in.acc << acc_avr(0), acc_avr(1), acc_avr(2);
-                double dt_state = time_current - time_predict_last_const;
-                if (dt_state > 0.0) {
-                    kf_output.predict(dt_state, Q_output, input_in, true, false);
+                    double dt = time_current - time_predict_last_const;
+                    if (!prop_at_freq_of_imu) {
+                        double dt_cov = time_current - time_update_last;
+                        if (dt_cov > 0.0) {
+                            kf_output.predict(dt_cov, Q_output, input_in, false, true);
+                            time_update_last = time_current;
+                        }
+                    }
+                    kf_output.predict(dt, Q_output, input_in, true, false);
                     time_predict_last_const = time_current;
-                }
-                double dt_cov = time_current - time_update_last;
-                if (dt_cov > 0.0) {
-                    kf_output.predict(dt_cov, Q_output, input_in, false, true);
-                    time_update_last = time_current;
-                }
-            }
 
-            if (feats_down_size > 0 && !kf_output.update_iterated_dyn_share_modified()) {
-                return;
-            }
+                    if (feats_down_size < 1) {                        
+                        ROS_WARN("No point, skip this scan!\n");
+                        h_idx += time_seq[time_k];
+                        continue;
+                    }
+                    if (!kf_output.update_iterated_dyn_share_modified()) {
+                        h_idx += time_seq[time_k];
+                        continue;
+                    }
+                    
+                    if (publish_odometry_without_downsample) {
+                        PublishOdometry(pub_odom_aft_mapped_);
+                    }
 
-            for (std::size_t i = 0; i < feats_down_body->size(); ++i) {
-                PointBodyToWorld(&feats_down_body->points[i], &feats_down_world->points[i]);
+                    for (int j = 0; j < time_seq[time_k]; ++j) {
+                        PointType &point_body_j = feats_down_body->points[h_idx + j + 1];
+                        PointType &point_world_j = feats_down_world->points[h_idx + j + 1];
+                        PointBodyToWorld(&point_body_j, &point_world_j);
+                    }
+                    h_idx += time_seq[time_k];
+                }
+            } else {
+                if (!imu_deque.empty()) {
+                    imu_last = imu_next;
+                    imu_next = *(imu_deque.front());
+
+                    while (imu_next.header.stamp.toSec() > time_current &&
+                           imu_next.header.stamp.toSec() < meas.lidar_beg_time + lidar_time_inte) {
+                        if (is_first_frame) {
+                            {
+                                while (imu_next.header.stamp.toSec() < meas.lidar_beg_time + lidar_time_inte) {
+                                    imu_deque.pop_front();
+                                    if (imu_deque.empty()) break;
+                                    imu_last = imu_next;
+                                    imu_next = *(imu_deque.front());
+                                }
+                            }
+                            break;
+
+                            angvel_avr << imu_last.angular_velocity.x, imu_last.angular_velocity.y, imu_last.angular_velocity.z;
+                            acc_avr << imu_last.linear_acceleration.x, imu_last.linear_acceleration.y, imu_last.linear_acceleration.z;
+
+                            imu_upda_cov = true;
+                            time_update_last = time_current;
+                            time_predict_last_const = time_current;
+
+                            is_first_frame = false;
+                        }
+                        time_current = imu_next.header.stamp.toSec();
+
+                        if (!is_first_frame) {
+                            double dt = time_current - time_predict_last_const;
+                            double dt_cov = time_current - time_update_last;
+                            if (dt_cov > 0.0) {
+                                kf_output.predict(dt_cov, Q_output, input_in, false, true);
+                                time_update_last = time_current;
+                            }
+                            kf_output.predict(dt, Q_output, input_in, true, false);
+
+                            time_predict_last_const = time_current;
+
+                            angvel_avr << imu_next.angular_velocity.x, imu_next.angular_velocity.y, imu_next.angular_velocity.z;
+                            acc_avr << imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z;
+                            kf_output.update_iterated_dyn_share_IMU();
+                            imu_deque.pop_front();
+                            if (imu_deque.empty()) break;
+                            imu_last = imu_next;
+                            imu_next = *(imu_deque.front());
+                        } else {
+                            imu_deque.pop_front();
+                            if (imu_deque.empty()) break;
+                            imu_last = imu_next;
+                            imu_next = *(imu_deque.front());
+                        }
+                    }
+                }
             }
         } else {
-            input_ikfom input_in;
-            time_current = meas.lidar_last_time;
-
-            if (imu_en) {
-                if (first_input_update) {
-                    t_last = meas.lidar_beg_time;
-                    time_update_last = meas.lidar_beg_time;
-                    first_input_update = false;
-                }
-
-                while (!imu_deque.empty() && imu_deque.front()->header.stamp.toSec() <= time_current) {
-                    const auto &imu_msg = imu_deque.front();
-                    const double imu_time = imu_msg->header.stamp.toSec();
-                    input_in.gyro << imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z;
-                    input_in.acc << imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z;
-                    input_in.acc = input_in.acc * gravity_norm / acc_norm;
-
-                    double dt_cov = imu_time - time_update_last;
-                    if (dt_cov > 0.0) {
-                        kf_input.predict(dt_cov, Q_input, input_in, false, true);
-                        time_update_last = imu_time;
+            bool imu_prop_cov = false;
+            effct_feat_num = 0;
+            if (time_seq.size() > 0) {
+                double pcl_beg_time = meas.lidar_beg_time;
+                h_idx = -1;
+                for (time_k = 0; time_k < time_seq.size(); time_k++) {
+                    PointType &point_body = feats_down_body->points[h_idx + time_seq[time_k]];
+                    time_current = point_body.curvature / 1000.0 + pcl_beg_time;
+                    if (is_first_frame) {
+                        while (time_current > imu_next.header.stamp.toSec()) {
+                            imu_deque.pop_front();
+                            if (imu_deque.empty()) break;
+                            imu_last = imu_next;
+                            imu_next = *(imu_deque.front());
+                        }
+                        imu_prop_cov = true;
+                        is_first_frame = false;
+                        t_last = time_current;
+                        time_update_last = time_current;
+                        input_in.gyro << imu_last.angular_velocity.x, imu_last.angular_velocity.y, imu_last.angular_velocity.z;
+                        input_in.acc << imu_last.linear_acceleration.x, imu_last.linear_acceleration.y, imu_last.linear_acceleration.z;
+                        input_in.acc = input_in.acc * gravity_norm / acc_norm;
                     }
 
-                    double dt_state = imu_time - t_last;
-                    if (dt_state > 0.0) {
-                        kf_input.predict(dt_state, Q_input, input_in, true, false);
-                        t_last = imu_time;
+                    while (time_current > imu_next.header.stamp.toSec()) {
+                        imu_deque.pop_front();
+
+                        input_in.gyro << imu_last.angular_velocity.x, imu_last.angular_velocity.y, imu_last.angular_velocity.z;
+                        input_in.acc << imu_last.linear_acceleration.x, imu_last.linear_acceleration.y, imu_last.linear_acceleration.z;
+                        input_in.acc = input_in.acc * gravity_norm / acc_norm;
+                        double dt = imu_last.header.stamp.toSec() - t_last;
+
+                        double dt_cov = imu_last.header.stamp.toSec() - time_update_last;
+                        if (dt_cov > 0.0) {
+                            kf_input.predict(dt_cov, Q_input, input_in, false, true);
+                            time_update_last = imu_last.header.stamp.toSec();
+                        }
+                        kf_input.predict(dt, Q_input, input_in, true, false);
+                        t_last = imu_last.header.stamp.toSec();
+                        imu_prop_cov = true;
+
+                        if (imu_deque.empty()) break;
+                        imu_last = imu_next;
+                        imu_next = *(imu_deque.front());
                     }
 
-                    imu_last = *imu_msg;
-                    imu_deque.pop_front();
-                }
-            }
-
-            {
-                double dt_cov = time_current - time_update_last;
-                if (dt_cov > 0.0) {
-                    kf_input.predict(dt_cov, Q_input, input_in, false, true);
-                    time_update_last = time_current;
-                }
-                double dt_state = time_current - t_last;
-                if (dt_state > 0.0) {
-                    kf_input.predict(dt_state, Q_input, input_in, true, false);
+                    double dt = time_current - t_last;
                     t_last = time_current;
+                    if (!prop_at_freq_of_imu) {
+                        double dt_cov = time_current - time_update_last;
+                        if (dt_cov > 0.0) {
+                            kf_input.predict(dt_cov, Q_input, input_in, false, true);
+                            time_update_last = time_current;
+                        }
+                    }
+                    kf_input.predict(dt, Q_input, input_in, true, false);
+
+                    if (feats_down_size < 1) {                        
+                        ROS_WARN("No point, skip this scan!\n");
+                        h_idx += time_seq[time_k];
+                        continue;
+                    }
+                    if (!kf_input.update_iterated_dyn_share_modified()) {
+                        h_idx += time_seq[time_k];
+                        continue;
+                    }
+
+                    if(publish_odometry_without_downsample) {
+                        PublishOdometry(pub_odom_aft_mapped_);
+                    }
+
+                    for (int j = 0; j < time_seq[time_k]; ++j) {
+                        PointType &point_body_j = feats_down_body->points[h_idx + j + 1];
+                        PointType &point_world_j = feats_down_world->points[h_idx + j + 1];
+                        PointBodyToWorld(&point_body_j, &point_world_j);
+                    }
+                    h_idx += time_seq[time_k];
                 }
-            }
+            } else {
+                if (!imu_deque.empty()) {
+                    imu_last = imu_next;
+                    imu_next = *(imu_deque.front());
+                    while (imu_next.header.stamp.toSec() > time_current &&
+                           imu_next.header.stamp.toSec() < meas.lidar_beg_time + lidar_time_inte) {
+                        if (is_first_frame) {
+                            {
+                                while (imu_next.header.stamp.toSec() < meas.lidar_beg_time + lidar_time_inte) {
+                                    imu_deque.pop_front();
+                                    if (imu_deque.empty()) break;
+                                    imu_last = imu_next;
+                                    imu_next = *(imu_deque.front());
+                                }
+                            }
+                            break;
 
-            if (feats_down_size > 0 && !kf_input.update_iterated_dyn_share_modified()) {
-                return;
-            }
+                            imu_prop_cov = true;
 
-            for (std::size_t i = 0; i < feats_down_body->size(); ++i) {
-                PointBodyToWorld(&feats_down_body->points[i], &feats_down_world->points[i]);
+                            t_last = time_current;
+                            time_update_last = time_current;
+                            input_in.gyro << imu_last.angular_velocity.x, imu_last.angular_velocity.y, imu_last.angular_velocity.z;
+                            input_in.acc << imu_last.linear_acceleration.x, imu_last.linear_acceleration.y, imu_last.linear_acceleration.z;
+                            input_in.acc = input_in.acc * gravity_norm / acc_norm;
+
+                            is_first_frame = false;
+                        }
+                        time_current = imu_next.header.stamp.toSec();
+
+                        if (!is_first_frame) {
+                            double dt = time_current - t_last;
+
+                            double dt_cov = time_current - time_update_last;
+                            if (dt_cov > 0.0) {
+                                time_update_last = imu_next.header.stamp.toSec();
+                            }
+
+                            t_last = imu_next.header.stamp.toSec();
+
+                            input_in.gyro << imu_next.angular_velocity.x, imu_next.angular_velocity.y, imu_next.angular_velocity.z;
+                            input_in.acc << imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z;
+                            input_in.acc = input_in.acc * gravity_norm / acc_norm;
+                            imu_deque.pop_front();
+                            if (imu_deque.empty()) break;
+                            imu_last = imu_next;
+                            imu_next = *(imu_deque.front());
+                        } else {
+                            imu_deque.pop_front();
+                            if (imu_deque.empty()) break;
+                            imu_last = imu_next;
+                            imu_next = *(imu_deque.front());
+                        }
+                    }
+                }
             }
         }
 
@@ -475,7 +653,6 @@ bool LaserMapping::SyncPackages(MeasureGroup& meas) {
         if (p_imu->imu_need_init_) {
             double imu_time = imu_deque.front()->header.stamp.toSec();
             meas.imu.shrink_to_fit();
-
             imu_next = *(imu_deque.front());
             while (imu_time < meas.lidar_beg_time + lidar_time_inte) {
                 meas.imu.emplace_back(imu_deque.front());
@@ -603,7 +780,7 @@ void LaserMapping::LivoxPclCallback(const livox_ros_driver::CustomMsg::ConstPtr 
             timestamp_lidar.pop_front();
         }
     } else {
-        PointCloudXYZI::Ptr  ptr(new PointCloudXYZI(10000,1));
+        PointCloudXYZI::Ptr ptr(new PointCloudXYZI(10000,1));
         p_pre->process(msg, ptr); 
         if (con_frame) {
             if (frame_ct == 0) {
@@ -837,88 +1014,82 @@ void LaserMapping::h_model_input(
 ) {
     VF(4) pabcd;
     pabcd.setZero();
-    normvec->resize(feats_down_size);
-    int effect_num = 0;
-    std::size_t idx = 0;
-
-    for (std::size_t k = 0; k < time_seq.size(); ++k) {
-        for (int j = 0; j < time_seq[k] && idx + j < feats_down_body->points.size(); ++j) {
-            PointType& point_body_j = feats_down_body->points[idx + j];
-            PointType& point_world_j = feats_down_world->points[idx + j];
-            PointBodyToWorld(&point_body_j, &point_world_j);
-
-            V3D p_body = pbody_list[idx + j];
-            double p_norm = p_body.norm();
-            auto& points_near = nearest_points[idx + j];
+    normvec->resize(time_seq[time_k]);
+    int effect_num_k = 0;
+    for (int j = 0; j < time_seq[time_k]; j++) {
+        PointType &point_body_j = feats_down_body->points[h_idx + j + 1];
+        PointType &point_world_j = feats_down_world->points[h_idx + j + 1];
+        PointBodyToWorld(&point_body_j, &point_world_j);
+        V3D p_body = pbody_list[h_idx + j + 1];
+        double p_norm = p_body.norm();
+        {
+            auto &points_near = nearest_points[h_idx + j + 1];
             ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS);
-
-            point_selected_surf[idx + j] = false;
-            if (points_near.size() >= NUM_MATCH_POINTS &&
-                esti_plane(pabcd, points_near, static_cast<float>(plane_thr))) {
-                float pd2 = fabs(
-                    pabcd(0) * point_world_j.x + pabcd(1) * point_world_j.y +
-                    pabcd(2) * point_world_j.z + pabcd(3));
-                if (p_norm > match_s * pd2 * pd2) {
-                    point_selected_surf[idx + j] = true;
-                    normvec->points[idx + j].x = pabcd(0);
-                    normvec->points[idx + j].y = pabcd(1);
-                    normvec->points[idx + j].z = pabcd(2);
-                    normvec->points[idx + j].intensity = pabcd(3);
-                    ++effect_num;
+            if (points_near.size() < NUM_MATCH_POINTS) {
+                point_selected_surf[h_idx + j + 1] = false;
+            } else {
+                point_selected_surf[h_idx + j + 1] = false;
+                if (esti_plane(pabcd, points_near, static_cast<float>(plane_thr))) {
+                    float pd2 = fabs(
+                        pabcd(0) * point_world_j.x + pabcd(1) * point_world_j.y
+                        + pabcd(2) * point_world_j.z + pabcd(3));
+                    if (p_norm > match_s * pd2 * pd2) {
+                        point_selected_surf[h_idx + j + 1] = true;
+                        normvec->points[j].x = pabcd(0);
+                        normvec->points[j].y = pabcd(1);
+                        normvec->points[j].z = pabcd(2);
+                        normvec->points[j].intensity = pabcd(3);
+                        effect_num_k++;
+                    }
                 }
             }
         }
-        idx += time_seq[k];
     }
 
-    if (effect_num == 0) {
+    if (effect_num_k == 0) {
         ekfom_data.valid = false;
         return;
     }
     ekfom_data.M_Noise = laser_point_cov;
-    ekfom_data.h_x.resize(effect_num, 12);
-    ekfom_data.h_x = Eigen::MatrixXd::Zero(effect_num, 12);
-    ekfom_data.z.resize(effect_num);
+    ekfom_data.h_x.resize(effect_num_k, 12);
+    ekfom_data.h_x = Eigen::MatrixXd::Zero(effect_num_k, 12);
+    ekfom_data.z.resize(effect_num_k);
     int m = 0;
-    idx = 0;
 
-    for (std::size_t k = 0; k < time_seq.size(); ++k) {
-        for (int j = 0; j < time_seq[k] && idx + j < feats_down_body->points.size(); ++j) {
-            if (point_selected_surf[idx + j]) {
-                V3D norm_vec(normvec->points[idx + j].x, normvec->points[idx + j].y, normvec->points[idx + j].z);
+    for (int j = 0; j < time_seq[time_k]; j++) {
+        if (point_selected_surf[h_idx + j + 1]) {
+            V3D norm_vec(normvec->points[j].x, normvec->points[j].y, normvec->points[j].z);
 
-                if (extrinsic_est_en) {
-                    V3D p_body = pbody_list[idx + j];
-                    M3D p_crossmat, p_imu_crossmat;
-                    p_crossmat << SKEW_SYM_MATRX(p_body);
-                    V3D point_imu = s.offset_R_L_I * p_body + s.offset_T_L_I;
-                    p_imu_crossmat << SKEW_SYM_MATRX(point_imu);
-                    V3D C(s.rot.transpose() * norm_vec);
-                    V3D A(p_imu_crossmat * C);
-                    V3D B(p_crossmat * s.offset_R_L_I.transpose() * C);
-                    ekfom_data.h_x.block<1, 12>(m, 0)
-                        << norm_vec(0), norm_vec(1), norm_vec(2), VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B),
-                        VEC_FROM_ARRAY(C);
-                } else {
-                    M3D point_crossmat = crossmat_list[idx + j];
-                    V3D C(s.rot.transpose() * norm_vec);
-                    V3D A(point_crossmat * C);
-                    ekfom_data.h_x.block<1, 12>(m, 0)
-                        << norm_vec(0), norm_vec(1), norm_vec(2), VEC_FROM_ARRAY(A),
-                        0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
-                }
-                ekfom_data.z(m) =
-                    -norm_vec(0) * feats_down_world->points[idx + j].x
-                    - norm_vec(1) * feats_down_world->points[idx + j].y
-                    - norm_vec(2) * feats_down_world->points[idx + j].z
-                    - normvec->points[idx + j].intensity;
-
-                ++m;
+            if (extrinsic_est_en) {
+                V3D p_body = pbody_list[h_idx + j + 1];
+                M3D p_crossmat, p_imu_crossmat;
+                p_crossmat << SKEW_SYM_MATRX(p_body);
+                V3D point_imu = s.offset_R_L_I * p_body + s.offset_T_L_I;
+                p_imu_crossmat << SKEW_SYM_MATRX(point_imu);
+                V3D C(s.rot.transpose() * norm_vec);
+                V3D A(p_imu_crossmat * C);
+                V3D B(p_crossmat * s.offset_R_L_I.transpose() * C);
+                ekfom_data.h_x.block<1, 12>(m, 0)
+                    << norm_vec(0), norm_vec(1), norm_vec(2), VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B),
+                    VEC_FROM_ARRAY(C);
+            } else {
+                M3D point_crossmat = crossmat_list[h_idx + j + 1];
+                V3D C(s.rot.transpose() * norm_vec);
+                V3D A(point_crossmat * C);
+                ekfom_data.h_x.block<1, 12>(m, 0)
+                    << norm_vec(0), norm_vec(1), norm_vec(2), VEC_FROM_ARRAY(A),
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
             }
+            ekfom_data.z(m) =
+                -norm_vec(0) * feats_down_world->points[h_idx + j + 1].x
+                - norm_vec(1) * feats_down_world->points[h_idx + j + 1].y
+                - norm_vec(2) * feats_down_world->points[h_idx + j + 1].z
+                - normvec->points[j].intensity;
+
+            m++;
         }
-        idx += time_seq[k];
     }
-    effct_feat_num += effect_num;
+    effct_feat_num += effect_num_k;
 }
 
 void LaserMapping::h_model_output(
@@ -929,61 +1100,55 @@ void LaserMapping::h_model_output(
 ) {
     VF(4) pabcd;
     pabcd.setZero();
-    normvec->resize(feats_down_size);
-    int effect_num = 0;
-    std::size_t idx = 0;
-
-    for (std::size_t k = 0; k < time_seq.size(); ++k) {
-        for (int j = 0; j < time_seq[k] && idx + j < feats_down_body->points.size(); ++j) {
-            PointType& point_body_j = feats_down_body->points[idx + j];
-            PointType& point_world_j = feats_down_world->points[idx + j];
-            PointBodyToWorld(&point_body_j, &point_world_j);
-
-            V3D p_body = pbody_list[idx + j];
-            double p_norm = p_body.norm();
-            auto& points_near = nearest_points[idx + j];
+    normvec->resize(time_seq[time_k]);
+    int effect_num_k = 0;
+    for (int j = 0; j < time_seq[time_k]; j++) {
+        PointType &point_body_j = feats_down_body->points[h_idx + j + 1];
+        PointType &point_world_j = feats_down_world->points[h_idx + j + 1];
+        PointBodyToWorld(&point_body_j, &point_world_j);
+        V3D p_body = pbody_list[h_idx + j + 1];
+        double p_norm = p_body.norm();
+        {
+            auto &points_near = nearest_points[h_idx + j + 1];
             ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS);
 
-            point_selected_surf[idx + j] = false;
-            if (points_near.size() >= NUM_MATCH_POINTS
-                && esti_plane(pabcd, points_near, static_cast<float>(plane_thr)))
-            {
-                float pd2 = fabs(
-                    pabcd(0) * point_world_j.x + pabcd(1) * point_world_j.y + pabcd(2) * point_world_j.z
-                    + pabcd(3)
-                );
-                if (p_norm > match_s * pd2 * pd2) {
-                    point_selected_surf[idx + j] = true;
-                    normvec->points[idx + j].x = pabcd(0);
-                    normvec->points[idx + j].y = pabcd(1);
-                    normvec->points[idx + j].z = pabcd(2);
-                    normvec->points[idx + j].intensity = pabcd(3);
-                    ++effect_num;
+            if (points_near.size() < NUM_MATCH_POINTS) {
+                point_selected_surf[h_idx + j + 1] = false;
+            } else {
+                point_selected_surf[h_idx + j + 1] = false;
+                if (esti_plane(pabcd, points_near, static_cast<float>(plane_thr))) {
+                    float pd2 = fabs(
+                        pabcd(0) * point_world_j.x + pabcd(1) * point_world_j.y
+                        + pabcd(2) * point_world_j.z + pabcd(3));
+                    if (p_norm > match_s * pd2 * pd2) {
+                        point_selected_surf[h_idx + j + 1] = true;
+                        normvec->points[j].x = pabcd(0);
+                        normvec->points[j].y = pabcd(1);
+                        normvec->points[j].z = pabcd(2);
+                        normvec->points[j].intensity = pabcd(3);
+                        effect_num_k++;
+                    }
                 }
             }
         }
-        idx += time_seq[k];
     }
 
-    if (effect_num == 0) {
+    if (effect_num_k == 0) {
         ekfom_data.valid = false;
         return;
     }
 
     ekfom_data.M_Noise = laser_point_cov;
-    ekfom_data.h_x.resize(effect_num, 12);
-    ekfom_data.h_x.setZero();
-    ekfom_data.z.resize(effect_num);
+    ekfom_data.h_x.resize(effect_num_k, 12);
+    ekfom_data.h_x = Eigen::MatrixXd::Zero(effect_num_k, 12);
+    ekfom_data.z.resize(effect_num_k);
 
     int m = 0;
-    idx = 0;
-    for (std::size_t k = 0; k < time_seq.size(); ++k) {
-        for (int j = 0; j < time_seq[k] && idx + j < feats_down_body->points.size(); ++j) {
-            if (!point_selected_surf[idx + j]) { continue; }
-
-            V3D norm_vec(normvec->points[idx + j].x, normvec->points[idx + j].y, normvec->points[idx + j].z);
+    for (int j = 0; j < time_seq[time_k]; j++) {
+        if (point_selected_surf[h_idx + j + 1]) {
+            V3D norm_vec(normvec->points[j].x, normvec->points[j].y, normvec->points[j].z);
             if (extrinsic_est_en) {
-                V3D p_body = pbody_list[idx + j];
+                V3D p_body = pbody_list[h_idx + j + 1];
                 M3D p_crossmat, p_imu_crossmat;
                 p_crossmat << SKEW_SYM_MATRX(p_body);
                 V3D point_imu = s.offset_R_L_I * p_body + s.offset_T_L_I;
@@ -994,22 +1159,21 @@ void LaserMapping::h_model_output(
                 ekfom_data.h_x.block<1, 12>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2), VEC_FROM_ARRAY(A),
                     VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
             } else {
-                M3D point_crossmat = crossmat_list[idx + j];
+                M3D point_crossmat = crossmat_list[h_idx + j + 1];
                 V3D C(s.rot.transpose() * norm_vec);
                 V3D A(point_crossmat * C);
                 ekfom_data.h_x.block<1, 12>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2), VEC_FROM_ARRAY(A),
                     0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
             }
 
-            ekfom_data.z(m) = -norm_vec(0) * feats_down_world->points[idx + j].x
-                            - norm_vec(1) * feats_down_world->points[idx + j].y
-                            - norm_vec(2) * feats_down_world->points[idx + j].z
-                            - normvec->points[idx + j].intensity;
-            ++m;
+            ekfom_data.z(m) = -norm_vec(0) * feats_down_world->points[h_idx + j + 1].x
+                            - norm_vec(1) * feats_down_world->points[h_idx + j + 1].y
+                            - norm_vec(2) * feats_down_world->points[h_idx + j + 1].z
+                            - normvec->points[j].intensity;
+            m++;
         }
-        idx += time_seq[k];
     }
-    effct_feat_num += effect_num;
+    effct_feat_num += effect_num_k;
 }
 
 void LaserMapping::h_model_IMU_output(state_output& s, esekfom::dyn_share_modified<double>& ekfom_data) {
