@@ -3,12 +3,10 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <livox_ros_driver/CustomMsg.h>
 
-using namespace std;
+#include "common_lib.h"
+
 
 #define IS_VALID(a) ((abs(a) > 1e8) ? true : false)
-
-typedef pcl::PointXYZINormal PointType;
-typedef pcl::PointCloud<PointType> PointCloudXYZI;
 
 enum LID_TYPE { AVIA = 1, VELO16, OUST64, HESAIxt32 }; // {1, 2, 3, 4}
 enum TIME_UNIT { SEC = 0, MS = 1, US = 2, NS = 3 };

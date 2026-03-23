@@ -1,78 +1,85 @@
-#pragma once
+#ifndef LASER_MAPPING_H
+#define LASER_MAPPING_H
 
-#include "parameters.h"
-#include <atomic>
+
+#include <malloc.h>
+#include <Eigen/Eigen>
+#include <Eigen/Core>
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/common/transforms.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <ros/ros.h>
+#include <livox_ros_driver/CustomMsg.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
-#include <pcl/filters/voxel_grid.h>
+#include <nav_msgs/Odometry.h>
+#include <nav_msgs/Path.h>
+#include <visualization_msgs/Marker.h>
+#include <tf/transform_datatypes.h>
+#include <tf/transform_broadcaster.h>
 
+#include "ivox/ivox3d.h"
+#include "common_lib.h"
+#include "IMU_Processing.h"
+
+
+// #define IVOX_NODE_TYPE_PHC
+#ifdef IVOX_NODE_TYPE_PHC
+    using IVoxType = faster_lio::IVox<3, faster_lio::IVoxNodeType::PHC, PointType>;
+#else
+    using IVoxType = faster_lio::IVox<3, faster_lio::IVoxNodeType::DEFAULT, PointType>;
+#endif
+
+
+// LaserMapping 负责整个在线建图流程的编排：
+// 1. 读取参数、初始化 EKF / 地图 / ROS 通信对象。
+// 2. 接收 IMU 与 LiDAR 回调，并在内部做时序对齐。
+// 3. 驱动状态传播、点面匹配、地图增量更新与结果发布。
 class LaserMapping {
 public:
-    static constexpr int kMaxLogSize = 720000;
+    LaserMapping();
+    ~LaserMapping();
 
-    explicit LaserMapping(ros::NodeHandle &nh);
-    static LaserMapping &activeInstance();
-    static void handleSignal(int sig);
+    void InitROS(ros::NodeHandle &nh);
+    void Run();
+    void Finish();
 
-    int run();
+    void StandardPclCallback(const sensor_msgs::PointCloud2::ConstPtr &msg);
+    void LivoxPclCallback(const livox_ros_driver::CustomMsg::ConstPtr &msg);
+    void ImuCallback(const sensor_msgs::Imu::ConstPtr &msg_in);
+
 
 private:
-    static void hModelInput(
-        state_input &s,
-        Eigen::Matrix3d cov_p,
-        Eigen::Matrix3d cov_R,
-        esekfom::dyn_share_modified<double> &ekfom_data);
-    static void hModelOutput(
-        state_output &s,
-        Eigen::Matrix3d cov_p,
-        Eigen::Matrix3d cov_R,
-        esekfom::dyn_share_modified<double> &ekfom_data);
-    static void hModelImuOutput(state_output &s, esekfom::dyn_share_modified<double> &ekfom_data);
+    bool LoadParams(ros::NodeHandle &nh);
+    void SubAndPubToROS(ros::NodeHandle &nh);
+    
+    bool SyncPackages(MeasureGroup &meas);
+    void MapIncremental();
+    
+    void PublishInitMap(const ros::Publisher &pub_laser_cloud_full_res);
+    void PublishFrameWorld(const ros::Publisher &pub_laser_cloud_full_res);
+    void PublishFrameBody(const ros::Publisher &pub_laser_cloud_full_body);
+    void PublishOdometry(const ros::Publisher &pub_odom_aft_mapped);
+    void PublishPath(const ros::Publisher &pub_path);
+    
+    void PointBodyToWorld(PointType const * const pi, PointType * const po);
+    void PointBodyLidarToImu(PointType const * const pi, PointType * const po);
 
-    void initialize();
-    void cleanup();
-    void handleReset();
-    void handleFirstScan();
-    void prepareMeasurement();
-    bool ensureImuInitialized();
-    bool initializeMapIfNeeded();
-    void prepareStateEstimation();
-    void standardPclCallback(const sensor_msgs::PointCloud2::ConstPtr &msg);
-    void livoxPclCallback(const livox_ros_driver::CustomMsg::ConstPtr &msg);
-    void imuCallback(const sensor_msgs::Imu::ConstPtr &msg_in);
-    bool syncPackages(MeasureGroup &meas);
-    void processOutputStateMode(V3D &euler_cur);
-    void processOutputStateWithTimeSequence(V3D &euler_cur);
-    void processOutputStateWithoutTimeSequence();
-    void processInputStateMode(V3D &euler_cur);
-    void processInputStateWithTimeSequence(V3D &euler_cur);
-    void processInputStateWithoutTimeSequence();
-    void publishAndLog(
-        double t0,
-        double t1,
-        double t3,
-        double t5,
-        int &frame_num,
-        double &aver_time_consu,
-        double &aver_time_icp,
-        double &aver_time_match,
-        double &aver_time_solve,
-        double &aver_time_propag,
-        V3D &euler_cur);
-    void pointBodyToWorld(PointType const * const pi, PointType * const po);
-    void dumpLioStateToLog(FILE *fp);
-    void pointBodyLidarToImu(PointType const * const pi, PointType * const po);
-    void mapIncremental();
-    void publishInitMap(const ros::Publisher &pub_laser_cloud_full_res);
-    void publishFrameWorld(const ros::Publisher &pub_laser_cloud_full_res);
-    void publishFrameBody(const ros::Publisher &pub_laser_cloud_full_body);
-    template<typename T>
-    void setPoseStamp(T &out);
-    void publishOdometry(const ros::Publisher &pub_odom_aft_mapped);
-    void publishPath(const ros::Publisher &pub_path);
+    Eigen::Matrix<double, 24, 24> process_noise_cov_input();
+    Eigen::Matrix<double, 30, 30> process_noise_cov_output();
 
-    ros::NodeHandle &nh_;
+private:
+    IVoxType::Options ivox_options_;
+    std::shared_ptr<IVoxType> ivox_;
+
+    std::shared_ptr<ImuProcess> p_imu;
+    std::shared_ptr<Preprocess> p_pre;
+
+    // ROS 通信对象：订阅原始传感器数据，发布建图结果。
     ros::Subscriber sub_pcl_;
     ros::Subscriber sub_imu_;
     ros::Publisher pub_laser_cloud_full_res_;
@@ -81,100 +88,84 @@ private:
     ros::Publisher pub_odom_aft_mapped_;
     ros::Publisher pub_path_;
 
-    pcl::VoxelGrid<PointType> down_size_filter_surf_;
-    pcl::VoxelGrid<PointType> down_size_filter_map_;
-
-    Eigen::Matrix<double, 24, 24> p_init_;
-    Eigen::Matrix<double, 24, 24> q_input_;
-    Eigen::Matrix<double, 30, 30> p_init_output_;
-    Eigen::Matrix<double, 30, 30> q_output_;
-    std::string root_dir_{ROOT_DIR};
-    std::atomic<bool> exit_requested_{false};
-    int time_log_counter_ = 0;
-    bool init_map_ = false;
-    bool first_scan_ = true;
-    bool reset_requested_ = false;
-    double match_time_ = 0.0;
-    double solve_time_ = 0.0;
-    double propag_time_ = 0.0;
-    double update_time_ = 0.0;
-    PointCloudXYZI::Ptr feats_undistort_{new PointCloudXYZI()};
-    PointCloudXYZI::Ptr init_feats_world_{new PointCloudXYZI()};
-    PointCloudXYZI::Ptr pcl_wait_save_{new PointCloudXYZI()};
     nav_msgs::Path path_;
     nav_msgs::Odometry odom_aft_mapped_;
     geometry_msgs::PoseStamped msg_body_pose_;
-    PointCloudXYZI::Ptr normvec_{new PointCloudXYZI(100000, 1)};
-    std::vector<int> time_seq_;
-    PointCloudXYZI::Ptr feats_down_body_{new PointCloudXYZI(10000, 1)};
-    PointCloudXYZI::Ptr feats_down_world_{new PointCloudXYZI(10000, 1)};
-    std::vector<V3D> pbody_list_;
-    std::vector<PointVector> nearest_points_;
-    std::shared_ptr<IVoxType> ivox_;
-    std::vector<float> point_search_sq_dis_{NUM_MATCH_POINTS};
-    bool point_selected_surf_[100000] = {0};
-    std::vector<M3D> crossmat_list_;
-    int effct_feat_num_ = 0;
-    int k_ = 0;
-    int idx_ = -1;
-    esekfom::esekf<state_input, 24, input_ikfom> kf_input_;
-    esekfom::esekf<state_output, 30, input_ikfom> kf_output_;
-    input_ikfom input_in_;
-    V3D angvel_avr_;
-    V3D acc_avr_;
-    V3D acc_avr_norm_;
-    int feats_down_size_ = 0;
-    V3D lidar_t_wrt_imu_{Zero3d};
-    M3D lidar_r_wrt_imu_{Eye3d};
-    double g_m_s2_ = 9.81;
 
-    std::mutex buffer_mutex_;
-    std::condition_variable buffer_cv_;
-    int scan_count_ = 0;
-    int frame_ct_ = 0;
-    int wait_num_ = 0;
-    bool lose_lid_ = false;
-    bool lidar_pushed_ = false;
-    bool imu_pushed_ = false;
-    double time_lag_imu_wrt_lidar_ = 0.0;
-    double timediff_imu_wrt_lidar_ = 0.0;
-    sensor_msgs::Imu imu_last_;
-    sensor_msgs::Imu imu_next_;
-    PointCloudXYZI::Ptr ptr_con_{new PointCloudXYZI()};
-    std::deque<PointCloudXYZI::Ptr> lidar_buffer_;
-    std::deque<double> time_buffer_;
-    std::deque<sensor_msgs::Imu::Ptr> imu_deque_;
-    std::vector<double> t1_log_{kMaxLogSize, 0.0};
-    std::vector<double> s_plot_{kMaxLogSize, 0.0};
-    std::vector<double> s_plot2_{kMaxLogSize, 0.0};
-    std::vector<double> s_plot3_{kMaxLogSize, 0.0};
-    std::vector<double> s_plot11_{kMaxLogSize, 0.0};
+    // 话题回调接收的雷达数据和IMU数据
+    std::deque<PointCloudXYZI::Ptr>  lidar_buffer;
+    std::deque<double>               time_buffer;
+    std::deque<sensor_msgs::Imu::Ptr> imu_deque;
 
-    static LaserMapping *active_instance_;
+    double last_timestamp_lidar = -1.0;
+    double lidar_end_time = 0.0;
+    int scan_count = 0;
+    bool cut_frame_init = false; // true;
+    int frame_ct = 0;
+    double time_con = 0.0;
+    PointCloudXYZI::Ptr ptr_con(new PointCloudXYZI());
 
-    FILE *fp_ = nullptr;
+    double last_timestamp_imu = -1.0;
+    double timediff_imu_wrt_lidar = 0.0;
+    double time_lag_IMU_wtr_lidar = 0.0;
+
+    bool lidar_pushed = false;
+    bool imu_pushed = false;
+    
+    // 降采样滤波器对象。
+    pcl::VoxelGrid<PointType> down_size_filter_surf;
+    pcl::VoxelGrid<PointType> down_size_filter_map;
+
+    // 点云与发布缓存。
+    PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
+    PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
+    PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
+    PointCloudXYZI::Ptr init_feats_world(new PointCloudXYZI());
+    bool init_map = false;
+
+    // EKF 初始化矩阵、过程噪声、运行期状态与配套缓存。
+    esekfom::esekf<state_input, 24, input_ikfom> kf_input;
+    esekfom::esekf<state_output, 30, input_ikfom> kf_output;
+    Eigen::Matrix<double, 30, 30> Q_output;
+    Eigen::Matrix<double, 24, 24> Q_input;
+
+
+private:
+    // 通过 ROS 参数服务器加载配置项
+    int lidar_type;
+    std::string lid_topic;
+    std::string imu_topic;
+    bool cut_frame = false;
+    bool con_frame = false;
+    int cut_frame_num = 1;
+
+    int  init_map_size = 10;
+    bool use_imu_as_input = false;
+    bool extrinsic_est_en = true;
+    bool imu_en = true;
+    bool space_down_sample = true;
+    double filter_size_surf_min = 0.5;
+    double filter_size_map_min = 0.5;
+    std::vector<double> extrinT{3, 0.0};
+    std::vector<double> extrinR{9, 0.0};
+    V3D Lidar_T_wrt_IMU;
+    M3D Lidar_R_wrt_IMU;
+    std::vector<double> gravity_init;
+    std::vector<double> gravity;
+
+	double gyr_cov_input;
+	double acc_cov_input;
+	double b_gyr_cov;
+	double b_acc_cov;
+	double vel_cov;
+	double gyr_cov_output;
+	double acc_cov_output;
+
+    bool publish_odometry_without_downsample;
+    bool path_en;
+    bool scan_pub_en;
+    bool scan_body_pub_en;
+
 };
 
-template<typename T>
-void LaserMapping::setPoseStamp(T &out)
-{
-    if (!use_imu_as_input) {
-        out.position.x = kf_output_.x_.pos(0);
-        out.position.y = kf_output_.x_.pos(1);
-        out.position.z = kf_output_.x_.pos(2);
-        Eigen::Quaterniond q(kf_output_.x_.rot);
-        out.orientation.x = q.coeffs()[0];
-        out.orientation.y = q.coeffs()[1];
-        out.orientation.z = q.coeffs()[2];
-        out.orientation.w = q.coeffs()[3];
-    } else {
-        out.position.x = kf_input_.x_.pos(0);
-        out.position.y = kf_input_.x_.pos(1);
-        out.position.z = kf_input_.x_.pos(2);
-        Eigen::Quaterniond q(kf_input_.x_.rot);
-        out.orientation.x = q.coeffs()[0];
-        out.orientation.y = q.coeffs()[1];
-        out.orientation.z = q.coeffs()[2];
-        out.orientation.w = q.coeffs()[3];
-    }
-}
+#endif // LASER_MAPPING_H

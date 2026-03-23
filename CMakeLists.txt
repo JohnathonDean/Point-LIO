@@ -74,10 +74,7 @@ link_directories(
 	${PCL_LIBRARY_DIRS}
 )
 
-generate_messages(
- DEPENDENCIES
- geometry_msgs
-)
+generate_messages(DEPENDENCIES geometry_msgs)
 
 catkin_package(
   CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime
@@ -85,8 +82,6 @@ catkin_package(
   INCLUDE_DIRS
 )
 
-add_executable(pointlio_mapping src/runMapping.cpp src/laserMapping.cpp
-                src/parameters.cpp src/preprocess.cpp
-                src/IMU_Processing.cpp)
+add_executable(pointlio_mapping src/runMapping.cpp src/laserMapping.cpp src/preprocess.cpp src/IMU_Processing.cpp)
 target_link_libraries(pointlio_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES})
 target_include_directories(pointlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
