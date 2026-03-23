@@ -93,8 +93,8 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointClo
 
 void Preprocess::process_cut_frame_livox(
     const livox_ros_driver::CustomMsg::ConstPtr &msg,
-    deque<PointCloudXYZI::Ptr> &pcl_out,
-    deque<double> &time_lidar,
+    std::deque<PointCloudXYZI::Ptr> &pcl_out,
+    std::deque<double> &time_lidar,
     const int required_frame_num,
     int scan_count)
 {
@@ -163,8 +163,8 @@ void Preprocess::process_cut_frame_livox(
 void
 Preprocess::process_cut_frame_pcl2(
     const sensor_msgs::PointCloud2::ConstPtr &msg,
-    deque<PointCloudXYZI::Ptr> &pcl_out,
-    deque<double> &time_lidar,
+    std::deque<PointCloudXYZI::Ptr> &pcl_out,
+    std::deque<double> &time_lidar,
     const int required_frame_num,
     int scan_count)
 {
@@ -186,7 +186,7 @@ Preprocess::process_cut_frame_pcl2(
         if (pl_orig.points[plsize - 1].time > 0) {
             given_offset_time = true;
         } else {
-            cout << "Compute offset time using constant rotation model." << endl;
+            std::cout << "Compute offset time using constant rotation model." << std::endl;
             given_offset_time = false;
             memset(is_first, true, sizeof(is_first));
         }
@@ -285,7 +285,7 @@ Preprocess::process_cut_frame_pcl2(
             }
         }
     } else {
-        cout << "Wrong LiDAR Type!!!" << endl;
+        std::cout << "Wrong LiDAR Type!!!" << std::endl;
         return;
     }
 
@@ -586,7 +586,7 @@ void Preprocess::hesai_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
     }
 }
 
-void Preprocess::give_feature(pcl::PointCloud<PointType> &pl, vector<orgtype> &types)
+void Preprocess::give_feature(pcl::PointCloud<PointType> &pl, std::vector<orgtype> &types)
 {
     int plsize = pl.size();
     int plsize2;
@@ -807,14 +807,14 @@ void Preprocess::pub_func(PointCloudXYZI &pl, const ros::Time &ct)
     output.header.stamp = ct;
 }
 
-int Preprocess::plane_judge(const PointCloudXYZI &pl, vector<orgtype> &types, uint i_cur, uint &i_nex, Eigen::Vector3d &curr_direct)
+int Preprocess::plane_judge(const PointCloudXYZI &pl, std::vector<orgtype> &types, uint i_cur, uint &i_nex, Eigen::Vector3d &curr_direct)
 {
     double group_dis = disA * types[i_cur].range + disB;
     group_dis = group_dis * group_dis;
     // i_nex = i_cur;
 
     double two_dis;
-    vector<double> disarr;
+    std::vector<double> disarr;
     disarr.reserve(20);
 
     for (i_nex = i_cur; i_nex < i_cur + group_size; i_nex++) {
@@ -905,7 +905,7 @@ int Preprocess::plane_judge(const PointCloudXYZI &pl, vector<orgtype> &types, ui
     return 1;
 }
 
-bool Preprocess::edge_jump_judge(const PointCloudXYZI &pl, vector<orgtype> &types, uint i, Surround nor_dir)
+bool Preprocess::edge_jump_judge(const PointCloudXYZI &pl, std::vector<orgtype> &types, uint i, Surround nor_dir)
 {
     if (nor_dir == 0) {
         if (types[i - 1].range < blind || types[i - 2].range < blind) {

@@ -3,6 +3,8 @@
 
 
 #include <malloc.h>
+#include <algorithm>
+#include <memory>
 #include <Eigen/Eigen>
 #include <Eigen/Core>
 #include <pcl/point_types.h>
@@ -24,7 +26,9 @@
 
 #include "ivox/ivox3d.h"
 #include "common_lib.h"
+#include "so3_math.h"
 #include "IMU_Processing.h"
+#include "preprocess.h"
 
 
 // #define IVOX_NODE_TYPE_PHC
@@ -40,39 +44,51 @@
 // 2. 接收 IMU 与 LiDAR 回调，并在内部做时序对齐。
 // 3. 驱动状态传播、点面匹配、地图增量更新与结果发布。
 class LaserMapping {
-public:
+  public:
     LaserMapping();
     ~LaserMapping();
 
-    void InitROS(ros::NodeHandle &nh);
+    void InitROS(ros::NodeHandle& nh);
     void Run();
     void Finish();
 
-    void StandardPclCallback(const sensor_msgs::PointCloud2::ConstPtr &msg);
-    void LivoxPclCallback(const livox_ros_driver::CustomMsg::ConstPtr &msg);
-    void ImuCallback(const sensor_msgs::Imu::ConstPtr &msg_in);
+    void StandardPclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg);
+    void LivoxPclCallback(const livox_ros_driver::CustomMsg::ConstPtr& msg);
+    void ImuCallback(const sensor_msgs::Imu::ConstPtr& msg_in);
 
+  private:
+    bool LoadParams(ros::NodeHandle& nh);
+    void SubAndPubToROS(ros::NodeHandle& nh);
 
-private:
-    bool LoadParams(ros::NodeHandle &nh);
-    void SubAndPubToROS(ros::NodeHandle &nh);
-    
-    bool SyncPackages(MeasureGroup &meas);
+    bool SyncPackages(MeasureGroup& meas);
     void MapIncremental();
-    
-    void PublishInitMap(const ros::Publisher &pub_laser_cloud_full_res);
-    void PublishFrameWorld(const ros::Publisher &pub_laser_cloud_full_res);
-    void PublishFrameBody(const ros::Publisher &pub_laser_cloud_full_body);
-    void PublishOdometry(const ros::Publisher &pub_odom_aft_mapped);
-    void PublishPath(const ros::Publisher &pub_path);
-    
-    void PointBodyToWorld(PointType const * const pi, PointType * const po);
-    void PointBodyLidarToImu(PointType const * const pi, PointType * const po);
+
+    void PublishInitMap(const ros::Publisher& pub_laser_cloud_full_res);
+    void PublishFrameWorld(const ros::Publisher& pub_laser_cloud_full_res);
+    void PublishFrameBody(const ros::Publisher& pub_laser_cloud_full_body);
+    void PublishOdometry(const ros::Publisher& pub_odom_aft_mapped);
+    void PublishPath(const ros::Publisher& pub_path);
+    void setPoseStamp(geometry_msgs::Pose& pose);
+
+    void PointBodyToWorld(PointType const* const pi, PointType* const po);
+    void PointBodyLidarToImu(PointType const* const pi, PointType* const po);
 
     Eigen::Matrix<double, 24, 24> process_noise_cov_input();
     Eigen::Matrix<double, 30, 30> process_noise_cov_output();
+    void h_model_input(
+        state_input& s,
+        Eigen::Matrix3d cov_p,
+        Eigen::Matrix3d cov_R,
+        esekfom::dyn_share_modified<double>& ekfom_data
+    );
+    void h_model_output(
+        state_output& s,
+        Eigen::Matrix3d cov_p,
+        Eigen::Matrix3d cov_R,
+        esekfom::dyn_share_modified<double>& ekfom_data
+    );
+    void h_model_IMU_output(state_output& s, esekfom::dyn_share_modified<double>& ekfom_data);
 
-private:
     IVoxType::Options ivox_options_;
     std::shared_ptr<IVoxType> ivox_;
 
@@ -103,7 +119,7 @@ private:
     bool cut_frame_init = false; // true;
     int frame_ct = 0;
     double time_con = 0.0;
-    PointCloudXYZI::Ptr ptr_con(new PointCloudXYZI());
+    PointCloudXYZI::Ptr ptr_con = PointCloudXYZI::Ptr(new PointCloudXYZI());
 
     double last_timestamp_imu = -1.0;
     double timediff_imu_wrt_lidar = 0.0;
@@ -117,17 +133,37 @@ private:
     pcl::VoxelGrid<PointType> down_size_filter_map;
 
     // 点云与发布缓存。
-    PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
-    PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
-    PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
-    PointCloudXYZI::Ptr init_feats_world(new PointCloudXYZI());
+    PointCloudXYZI::Ptr feats_undistort = PointCloudXYZI::Ptr(new PointCloudXYZI());
+    PointCloudXYZI::Ptr feats_down_body = PointCloudXYZI::Ptr(new PointCloudXYZI());
+    PointCloudXYZI::Ptr feats_down_world = PointCloudXYZI::Ptr(new PointCloudXYZI());
+    PointCloudXYZI::Ptr init_feats_world = PointCloudXYZI::Ptr(new PointCloudXYZI());
     bool init_map = false;
+    PointCloudXYZI::Ptr normvec = PointCloudXYZI::Ptr(new PointCloudXYZI());
+    std::vector<PointVector> nearest_points;
+    std::vector<M3D> crossmat_list;
+    std::vector<V3D> pbody_list;
+    std::vector<bool> point_selected_surf;
+    std::vector<int> time_seq;
+    std::size_t feats_down_size = 0;
+    int effct_feat_num = 0;
 
     // EKF 初始化矩阵、过程噪声、运行期状态与配套缓存。
     esekfom::esekf<state_input, 24, input_ikfom> kf_input;
     esekfom::esekf<state_output, 30, input_ikfom> kf_output;
     Eigen::Matrix<double, 30, 30> Q_output;
     Eigen::Matrix<double, 24, 24> Q_input;
+
+    sensor_msgs::Imu imu_last;
+    sensor_msgs::Imu imu_next;
+    MeasureGroup meas;
+    V3D angvel_avr = V3D::Zero();
+    V3D acc_avr = V3D::Zero();
+    double gravity_norm = 9.81;
+    double time_update_last = 0.0;
+    double time_predict_last_const = 0.0;
+    double t_last = 0.0;
+    bool first_output_update = true;
+    bool first_input_update = true;
 
 
 private:
@@ -137,10 +173,12 @@ private:
     std::string imu_topic;
     bool cut_frame = false;
     bool con_frame = false;
+    int con_frame_num = 1;
     int cut_frame_num = 1;
 
     int  init_map_size = 10;
     bool use_imu_as_input = false;
+    bool check_satu = true;
     bool extrinsic_est_en = true;
     bool imu_en = true;
     bool space_down_sample = true;
@@ -158,13 +196,32 @@ private:
 	double b_gyr_cov;
 	double b_acc_cov;
 	double vel_cov;
-	double gyr_cov_output;
-	double acc_cov_output;
+    double gyr_cov_output;
+    double acc_cov_output;
+    double imu_meas_omg_cov = 0.1;
+    double imu_meas_acc_cov = 0.1;
+    double lidar_time_inte = 0.1;
+    double satu_acc = 3.0;
+    double satu_gyro = 35.0;
+    double acc_norm = 1.0;
+    double plane_thr = 0.1;
+    double match_s = 81.0;
+    double laser_point_cov = 0.001;
 
     bool publish_odometry_without_downsample;
     bool path_en;
     bool scan_pub_en;
     bool scan_body_pub_en;
+    bool pcd_save_en = false;
+
+
+    bool lose_lid = false;
+    bool flg_first_scan = true;
+    double first_lidar_time = 0.0;
+    double first_imu_time = -1.0;
+    double time_current = 0.0;
+
+
 
 };
 

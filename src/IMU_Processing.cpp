@@ -1,5 +1,7 @@
 #include "IMU_Processing.h"
 
+#include "so3_math.h"
+
 // 构造函数只做轻量级状态初始化，不执行任何外部依赖操作。
 // 默认进入“需要 IMU 初始化”的状态，等待后续 Process 累计前几批 IMU 数据。
 ImuProcess::ImuProcess(): b_first_frame_(true), imu_need_init_(true) {

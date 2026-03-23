@@ -38,6 +38,7 @@
 
 #include <vector>
 #include <cstdlib>
+#include <functional>
 
 #include <boost/bind.hpp>
 #include <Eigen/Core>
@@ -84,25 +85,25 @@ public:
 	typedef Matrix<scalar_type, n, 1> vectorized_state;
 	typedef Matrix<scalar_type, m, 1> flatted_state;
 
-	typedef flatted_state processModel(state &, const input &);
-	typedef Eigen::Matrix<scalar_type, m, n> processMatrix1(state &, const input &);
-	typedef Eigen::Matrix<scalar_type, m, process_noise_dof> processMatrix2(state &, const input &);
+	typedef std::function<flatted_state(state &, const input &)> processModel;
+	typedef std::function<Eigen::Matrix<scalar_type, m, n>(state &, const input &)> processMatrix1;
+	typedef std::function<Eigen::Matrix<scalar_type, m, process_noise_dof>(state &, const input &)> processMatrix2;
 	typedef Eigen::Matrix<scalar_type, process_noise_dof, process_noise_dof> processnoisecovariance;
 
-	typedef void measurementModel_dyn_share_modified_cov(state &, Eigen::Matrix3d, Eigen::Matrix3d, dyn_share_modified<scalar_type> &);
-	typedef void measurementModel_dyn_share_modified(state &, dyn_share_modified<scalar_type> &);
+	typedef std::function<void(state &, Eigen::Matrix3d, Eigen::Matrix3d, dyn_share_modified<scalar_type> &)> measurementModel_dyn_share_modified_cov;
+	typedef std::function<void(state &, dyn_share_modified<scalar_type> &)> measurementModel_dyn_share_modified;
 
-	typedef Eigen::Matrix<scalar_type ,l, n> measurementMatrix1(state &);
-	typedef Eigen::Matrix<scalar_type , Eigen::Dynamic, n> measurementMatrix1_dyn(state &);
-	typedef Eigen::Matrix<scalar_type ,l, measurement_noise_dof> measurementMatrix2(state &);
-	typedef Eigen::Matrix<scalar_type ,Eigen::Dynamic, Eigen::Dynamic> measurementMatrix2_dyn(state &);
+	typedef std::function<Eigen::Matrix<scalar_type ,l, n>(state &)> measurementMatrix1;
+	typedef std::function<Eigen::Matrix<scalar_type , Eigen::Dynamic, n>(state &)> measurementMatrix1_dyn;
+	typedef std::function<Eigen::Matrix<scalar_type ,l, measurement_noise_dof>(state &)> measurementMatrix2;
+	typedef std::function<Eigen::Matrix<scalar_type ,Eigen::Dynamic, Eigen::Dynamic>(state &)> measurementMatrix2_dyn;
 	typedef Eigen::Matrix<scalar_type, measurement_noise_dof, measurement_noise_dof> measurementnoisecovariance;
 	typedef Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> measurementnoisecovariance_dyn;
 
 	esekf(const state &x = state(), const cov  &P = cov::Identity()): x_(x), P_(P){};
 
-	void init_dyn_share_modified_2h(processModel f_in, processMatrix1 f_x_in,
-									measurementModel_dyn_share_modified_cov h_dyn_share_in1) {
+	void init_dyn_share_modified_2h(const processModel &f_in, const processMatrix1 &f_x_in,
+									const measurementModel_dyn_share_modified_cov &h_dyn_share_in1) {
 		f = f_in;
 		f_x = f_x_in;
 		// f_w = f_w_in;
@@ -115,9 +116,9 @@ public:
 		x_.build_SEN_state();
 	}
 	
-	void init_dyn_share_modified_3h(processModel f_in, processMatrix1 f_x_in,
-									measurementModel_dyn_share_modified_cov h_dyn_share_in1,
-									measurementModel_dyn_share_modified h_dyn_share_in2) {
+	void init_dyn_share_modified_3h(const processModel &f_in, const processMatrix1 &f_x_in,
+									const measurementModel_dyn_share_modified_cov &h_dyn_share_in1,
+									const measurementModel_dyn_share_modified &h_dyn_share_in2) {
 		f = f_in;
 		f_x = f_x_in;
 		// f_w = f_w_in;
@@ -301,20 +302,20 @@ private:
 	cov F_x2 = cov::Identity();
 	cov L_ = cov::Identity();
 
-	processModel *f;
-	processMatrix1 *f_x;
-	processMatrix2 *f_w;
+	processModel f;
+	processMatrix1 f_x;
+	processMatrix2 f_w;
 
-	measurementMatrix1 *h_x;
-	measurementMatrix2 *h_v;
+	measurementMatrix1 h_x;
+	measurementMatrix2 h_v;
 
-	measurementMatrix1_dyn *h_x_dyn;
-	measurementMatrix2_dyn *h_v_dyn;
+	measurementMatrix1_dyn h_x_dyn;
+	measurementMatrix2_dyn h_v_dyn;
 
-	measurementModel_dyn_share_modified_cov *h_dyn_share_modified_1;
+	measurementModel_dyn_share_modified_cov h_dyn_share_modified_1;
 
-	measurementModel_dyn_share_modified *h_dyn_share_modified_2;
-	measurementModel_dyn_share_modified *h_dyn_share_modified_3;
+	measurementModel_dyn_share_modified h_dyn_share_modified_2;
+	measurementModel_dyn_share_modified h_dyn_share_modified_3;
 
 	int maximum_iter = 0;
 	scalar_type limit[n];

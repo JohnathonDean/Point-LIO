@@ -107,15 +107,15 @@ public:
 
     void process_cut_frame_livox(
         const livox_ros_driver::CustomMsg::ConstPtr &msg,
-        deque<PointCloudXYZI::Ptr> &pcl_out,
-        deque<double> &time_lidar,
+        std::deque<PointCloudXYZI::Ptr> &pcl_out,
+        std::deque<double> &time_lidar,
         const int required_frame_num,
         int scan_count);
 
     void process_cut_frame_pcl2(
         const sensor_msgs::PointCloud2::ConstPtr &msg,
-        deque<PointCloudXYZI::Ptr> &pcl_out,
-        deque<double> &time_lidar,
+        std::deque<PointCloudXYZI::Ptr> &pcl_out,
+        std::deque<double> &time_lidar,
         const int required_frame_num,
         int scan_count);
 
@@ -126,7 +126,7 @@ public:
     // sensor_msgs::PointCloud2::ConstPtr pointcloud;
     PointCloudXYZI pl_full, pl_corn, pl_surf;
     PointCloudXYZI pl_buff[128];  // maximum 128 line lidar
-    vector<orgtype> typess[128];  // maximum 128 line lidar
+    std::vector<orgtype> typess[128];  // maximum 128 line lidar
     float time_unit_scale;
     int lidar_type, point_filter_num, N_SCANS, SCAN_RATE, time_unit;
     double blind, det_range;
@@ -138,21 +138,21 @@ private:
     void oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
     void velodyne_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
     void hesai_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
-    void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
+    void give_feature(PointCloudXYZI &pl, std::vector<orgtype> &types);
     void pub_func(PointCloudXYZI &pl, const ros::Time &ct);
     int plane_judge(
         const PointCloudXYZI &pl,
-        vector<orgtype> &types,
+        std::vector<orgtype> &types,
         uint i,
         uint &i_nex,
         Eigen::Vector3d &curr_direct);
     bool small_plane(
         const PointCloudXYZI &pl,
-        vector<orgtype> &types,
+        std::vector<orgtype> &types,
         uint i_cur,
         uint &i_nex,
         Eigen::Vector3d &curr_direct);
-    bool edge_jump_judge(const PointCloudXYZI &pl, vector<orgtype> &types, uint i, Surround nor_dir);
+    bool edge_jump_judge(const PointCloudXYZI &pl, std::vector<orgtype> &types, uint i, Surround nor_dir);
 
     int group_size;
     double disA, disB, inf_bound;
