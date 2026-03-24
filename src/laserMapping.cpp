@@ -104,7 +104,9 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en,true);
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en,true);
-    nh.param<bool>("pcd_save_en", pcd_save_en, false);
+    nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
+    nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
+    nh.param<std::string>("pcd_save/dir", pcd_save_dir, "/tmp/pcd_save/");
 
     nh.param<float>("mapping/ivox_grid_resolution", ivox_options_.resolution_, 0.2);
     nh.param<int>("ivox_nearby_type", ivox_nearby_type, 18);
@@ -566,8 +568,12 @@ void LaserMapping::Run() {
 }
 
 void LaserMapping::Finish() {
-
-
+    if (pcl_wait_save->size() > 0 && pcd_save_en) {
+        std::string file_name = std::string("scans.pcd");
+        std::string all_points_dir = std::string(pcd_save_dir + "PCD/") + file_name;
+        pcl::PCDWriter pcd_writer;
+        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+    }
 }
 
 bool LaserMapping::SyncPackages(MeasureGroup& meas) {
@@ -840,18 +846,45 @@ void LaserMapping::PublishInitMap(const ros::Publisher &pub_laser_cloud_full_res
     pub_laser_cloud_full_res.publish(laserCloudmsg);
 }
 
-void LaserMapping::PublishFrameWorld(const ros::Publisher &pub_laser_cloud_full_res)
-{
-    feats_down_world->resize(feats_undistort->size());
-    for (std::size_t i = 0; i < feats_undistort->size(); ++i) {
-        PointBodyToWorld(&feats_undistort->points[i], &feats_down_world->points[i]);
+void LaserMapping::PublishFrameWorld(const ros::Publisher &pub_laser_cloud_full_res) {
+    if(scan_pub_en) {
+        int size = feats_down_world->points.size();
+        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+        for (int i = 0; i < size; i++) {
+            laserCloudWorld->points[i].x = feats_down_world->points[i].x;
+            laserCloudWorld->points[i].y = feats_down_world->points[i].y;
+            laserCloudWorld->points[i].z = feats_down_world->points[i].z;
+            laserCloudWorld->points[i].intensity = feats_down_world->points[i].intensity;
+        }
+        sensor_msgs::PointCloud2 laserCloudmsg;
+        pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+        laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+        laserCloudmsg.header.frame_id = "camera_init";
+        pub_laser_cloud_full_res.publish(laserCloudmsg);
     }
+    
+    if(pcd_save_en) {
+        int size = feats_down_world->points.size();
+        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+        for (int i = 0; i < size; i++) {
+            laserCloudWorld->points[i].x = feats_down_world->points[i].x;
+            laserCloudWorld->points[i].y = feats_down_world->points[i].y;
+            laserCloudWorld->points[i].z = feats_down_world->points[i].z;
+            laserCloudWorld->points[i].intensity = feats_down_world->points[i].intensity;
+        }
 
-    sensor_msgs::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*feats_down_world, laserCloudmsg);
-    laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
-    pub_laser_cloud_full_res.publish(laserCloudmsg);
+        *pcl_wait_save += *laserCloudWorld;
+        scan_wait_num++;
+        if (pcl_wait_save->size() > 0 && scan_wait_num >= pcd_save_interval) {
+            pcd_index ++;
+            string all_points_dir(string(pcd_save_dir + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
+            pcl::PCDWriter pcd_writer;
+            // cout << "current scan saved to /PCD/" << all_points_dir << endl;
+            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+            pcl_wait_save->clear();
+            scan_wait_num = 0;
+        }
+    }
 }
 
 void LaserMapping::PublishFrameBody(const ros::Publisher &pubLaserCloudFull_body)
@@ -874,23 +907,25 @@ void LaserMapping::PublishFrameBody(const ros::Publisher &pubLaserCloudFull_body
 
 void LaserMapping::setPoseStamp(geometry_msgs::Pose &pose)
 {
-    Eigen::Quaterniond q;
-    if (use_imu_as_input) {
-        pose.position.x = kf_input.x_.pos[0];
-        pose.position.y = kf_input.x_.pos[1];
-        pose.position.z = kf_input.x_.pos[2];
-        q = Eigen::Quaterniond(static_cast<M3D>(kf_input.x_.rot));
+    if (!use_imu_as_input) {
+        pose.position.x = kf_output.x_.pos(0);
+        pose.position.y = kf_output.x_.pos(1);
+        pose.position.z = kf_output.x_.pos(2);
+        Eigen::Quaterniond q(kf_output.x_.rot);
+        pose.orientation.x = q.x();
+        pose.orientation.y = q.y();
+        pose.orientation.z = q.z();
+        pose.orientation.w = q.w();
     } else {
-        pose.position.x = kf_output.x_.pos[0];
-        pose.position.y = kf_output.x_.pos[1];
-        pose.position.z = kf_output.x_.pos[2];
-        q = Eigen::Quaterniond(static_cast<M3D>(kf_output.x_.rot));
+        pose.position.x = kf_input.x_.pos(0);
+        pose.position.y = kf_input.x_.pos(1);
+        pose.position.z = kf_input.x_.pos(2);
+        Eigen::Quaterniond q(kf_input.x_.rot);
+        pose.orientation.x = q.x();
+        pose.orientation.y = q.y();
+        pose.orientation.z = q.z();
+        pose.orientation.w = q.w();
     }
-
-    pose.orientation.x = q.x();
-    pose.orientation.y = q.y();
-    pose.orientation.z = q.z();
-    pose.orientation.w = q.w();
 }
 
 void LaserMapping::PublishOdometry(const ros::Publisher &pubOdomAftMapped)

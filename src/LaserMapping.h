@@ -154,6 +154,11 @@ class LaserMapping {
     PointCloudXYZI::Ptr feats_down_world = PointCloudXYZI::Ptr(new PointCloudXYZI());
     PointCloudXYZI::Ptr init_feats_world = PointCloudXYZI::Ptr(new PointCloudXYZI());
 
+    int pcd_index = 0;
+    int scan_wait_num = 0;
+    PointCloudXYZI::Ptr pcl_wait_save = PointCloudXYZI::Ptr(new PointCloudXYZI());
+
+
     PointCloudXYZI::Ptr normvec = PointCloudXYZI::Ptr(new PointCloudXYZI());
     std::vector<PointVector> nearest_points;
     std::vector<M3D> crossmat_list;
@@ -224,6 +229,8 @@ class LaserMapping {
     bool scan_pub_en;
     bool scan_body_pub_en;
     bool pcd_save_en = false;
+    int pcd_save_interval = -1;
+    std::string pcd_save_dir;
 
 
 
