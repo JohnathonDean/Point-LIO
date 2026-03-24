@@ -848,36 +848,19 @@ void LaserMapping::PublishInitMap(const ros::Publisher &pub_laser_cloud_full_res
 
 void LaserMapping::PublishFrameWorld(const ros::Publisher &pub_laser_cloud_full_res) {
     if(scan_pub_en) {
-        int size = feats_down_world->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
-        for (int i = 0; i < size; i++) {
-            laserCloudWorld->points[i].x = feats_down_world->points[i].x;
-            laserCloudWorld->points[i].y = feats_down_world->points[i].y;
-            laserCloudWorld->points[i].z = feats_down_world->points[i].z;
-            laserCloudWorld->points[i].intensity = feats_down_world->points[i].intensity;
-        }
         sensor_msgs::PointCloud2 laserCloudmsg;
-        pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+        pcl::toROSMsg(*feats_down_world, laserCloudmsg);
         laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
         laserCloudmsg.header.frame_id = "camera_init";
         pub_laser_cloud_full_res.publish(laserCloudmsg);
     }
     
     if(pcd_save_en) {
-        int size = feats_down_world->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
-        for (int i = 0; i < size; i++) {
-            laserCloudWorld->points[i].x = feats_down_world->points[i].x;
-            laserCloudWorld->points[i].y = feats_down_world->points[i].y;
-            laserCloudWorld->points[i].z = feats_down_world->points[i].z;
-            laserCloudWorld->points[i].intensity = feats_down_world->points[i].intensity;
-        }
-
-        *pcl_wait_save += *laserCloudWorld;
+        *pcl_wait_save += *feats_down_world;
         scan_wait_num++;
         if (pcl_wait_save->size() > 0 && scan_wait_num >= pcd_save_interval) {
             pcd_index ++;
-            string all_points_dir(string(pcd_save_dir + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
+            std::string all_points_dir(std::string(pcd_save_dir + "PCD/scans_") + std::to_string(pcd_index) + std::string(".pcd"));
             pcl::PCDWriter pcd_writer;
             // cout << "current scan saved to /PCD/" << all_points_dir << endl;
             pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);

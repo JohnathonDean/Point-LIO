@@ -4,8 +4,6 @@
 #include "common_lib.h"
 
 
-
-
 Eigen::Matrix<double, 24, 1> get_f_input(state_input &s, const input_ikfom &in)
 {
 	Eigen::Matrix<double, 24, 1> res = Eigen::Matrix<double, 24, 1>::Zero();
