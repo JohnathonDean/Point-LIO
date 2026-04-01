@@ -268,33 +268,55 @@ void LaserMapping::Run() {
         }
 
         if (!use_imu_as_input) {
+            // 该分支表示“IMU 不作为系统显式输入量”，而是走输出状态滤波器 `kf_output`。
+            // 整体流程是：
+            // 1. 以压缩后的时间片 `time_seq` 为单位，按点时间戳从前到后处理一帧点云；
+            // 2. 在每个时间片处，把 IMU 队列推进到当前激光点对应时刻；
+            // 3. 先做状态连续传播，再在合适时机做协方差传播和 IMU 约束更新；
+            // 4. 用当前状态执行点到面匹配更新，再把该时间片里的点变换到世界系。
             bool imu_upda_cov = false;
             effct_feat_num = 0;
             if (time_seq.size() > 0) {
+                // `pcl_beg_time` 是当前这帧点云的起始时间。
+                // 后面每个点的真实时间 = 起始时间 + 点内相对时间（curvature 字段中编码，单位 ms）。
                 double pcl_beg_time = meas.lidar_beg_time;
+                // `h_idx` 用来记录当前时间片在压缩点序列中的起始偏移。
+                // 初始化为 -1，是因为后面访问区间末点时统一使用 `h_idx + time_seq[time_k]`。
                 h_idx = -1;
                 for (time_k = 0; time_k < time_seq.size(); time_k++) {
+                    // 取出当前时间片的“最后一个点”，用它的时间作为该片段的处理时刻。
+                    // 这样可以认为：这一小段点云都被校正到 `time_current` 对应的状态。
                     PointType &point_body = feats_down_body->points[h_idx + time_seq[time_k]];
                     time_current = point_body.curvature / 1000.0 + pcl_beg_time;
 
                     if (is_first_frame) {
                         if (imu_en) {
+                            // 首帧时先把 IMU 队列推进到不早于当前激光处理时刻的位置，
+                            // 避免使用明显过时的 IMU 观测初始化传播。
                             while (time_current > imu_next.header.stamp.toSec()) {
                                 imu_deque.pop_front();
                                 if (imu_deque.empty()) break;
                                 imu_last = imu_next;
                                 imu_next = *(imu_deque.front());
                             }
+                            // 保存当前可用 IMU 的角速度/加速度均值，
+                            // 供后续传播和 IMU 更新模型使用。
                             angvel_avr << imu_last.angular_velocity.x, imu_last.angular_velocity.y, imu_last.angular_velocity.z;
                             acc_avr << imu_last.linear_acceleration.x, imu_last.linear_acceleration.y, imu_last.linear_acceleration.z;
                         }
+                        // 首帧只做时间基准和状态基准的建立，不重复进入该初始化逻辑。
                         is_first_frame = false;
                         imu_upda_cov = true;
+                        // `time_update_last` 记录上一次进行协方差/测量更新的时刻；
+                        // `time_predict_last_const` 记录上一次做连续状态传播的时刻。
                         time_update_last = time_current;
                         time_predict_last_const = time_current;
                     }
 
                     if (imu_en && !imu_deque.empty()) {
+                        // 如果当前 `imu_next` 已经落后于传播时刻，需要先把 IMU 指针追上来。
+                        // `last_imu` 用于区分当前 `imu_next` 是否和队首指向同一条消息，
+                        // 防止在某些边界情况下重复消费同一帧 IMU。
                         bool last_imu = imu_next.header.stamp.toSec() == imu_deque.front()->header.stamp.toSec();
                         while (imu_next.header.stamp.toSec() < time_predict_last_const && !imu_deque.empty()) {
                             if (!last_imu) {
@@ -309,17 +331,23 @@ void LaserMapping::Run() {
                             }
                         }
 
+                        // 只要当前处理时刻晚于 `imu_next`，说明这条 IMU 应当被纳入传播过程。
                         bool imu_comes = time_current > imu_next.header.stamp.toSec();
                         while (imu_comes) {
                             imu_upda_cov = true;
+                            // 用即将消费的这条 IMU 更新当前平均角速度/线加速度。
                             angvel_avr << imu_next.angular_velocity.x, imu_next.angular_velocity.y, imu_next.angular_velocity.z;
                             acc_avr << imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z;
 
-                            /*** covariance update ***/
+                            // 第一步：把系统状态从上一个传播时刻推进到当前 IMU 时刻。
+                            // 这里 `true, false` 表示进行状态传播，但不单独展开协方差更新路径。
                             double dt = imu_next.header.stamp.toSec() - time_predict_last_const;
                             kf_output.predict(dt, Q_output, input_in, true, false);
                             time_predict_last_const = imu_next.header.stamp.toSec();
 
+                            // 第二步：如果距离上次更新已有正时间间隔，再补一次协方差传播，
+                            // 随后立刻使用 IMU 观测进行一次迭代更新。
+                            // 这一段的含义是：即使没有激光匹配，也让滤波器借助 IMU 约束修正自身统计量。
                             double dt_cov = imu_next.header.stamp.toSec() - time_update_last;
                             if (dt_cov > 0.0) {
                                 time_update_last = imu_next.header.stamp.toSec();
@@ -327,6 +355,7 @@ void LaserMapping::Run() {
                                 kf_output.update_iterated_dyn_share_IMU();
                             }
 
+                            // 当前 IMU 已处理完，移动到下一条 IMU。
                             imu_deque.pop_front();
                             if (imu_deque.empty()) break;
                             imu_last = imu_next;
@@ -335,14 +364,18 @@ void LaserMapping::Run() {
                         }
                     }
 
+                    // 把状态继续推进到当前激光时间片末端 `time_current`。
                     double dt = time_current - time_predict_last_const;
                     if (!prop_at_freq_of_imu) {
+                        // 若未开启“严格按 IMU 频率传播协方差”，则在激光时间片边界补一次协方差传播。
+                        // 这样做可以减少协方差更新频率，但仍保证点云匹配前的统计量是最新的。
                         double dt_cov = time_current - time_update_last;
                         if (dt_cov > 0.0) {
                             kf_output.predict(dt_cov, Q_output, input_in, false, true);
                             time_update_last = time_current;
                         }
                     }
+                    // 完成到当前激光时间片末端的状态外推。
                     kf_output.predict(dt, Q_output, input_in, true, false);
                     time_predict_last_const = time_current;
 
@@ -351,6 +384,8 @@ void LaserMapping::Run() {
                         h_idx += time_seq[time_k];
                         continue;
                     }
+                    // 用当前时间片对应的点云残差做一次激光匹配更新。
+                    // 更新失败时直接跳过这一片，继续处理后续片段。
                     if (!kf_output.update_iterated_dyn_share_modified()) {
                         h_idx += time_seq[time_k];
                         continue;
@@ -360,14 +395,20 @@ void LaserMapping::Run() {
                         PublishOdometry(pub_odom_aft_mapped_);
                     }
 
+                    // 把当前时间片中的点全部用更新后的位姿变换到世界坐标系。
+                    // 注意这里处理的是本时间片内部的点，而不是整帧点一次性统一变换，
+                    // 这样可以保留扫描期间的运动补偿效果。
                     for (int j = 0; j < time_seq[time_k]; ++j) {
                         PointType &point_body_j = feats_down_body->points[h_idx + j + 1];
                         PointType &point_world_j = feats_down_world->points[h_idx + j + 1];
                         PointBodyToWorld(&point_body_j, &point_world_j);
                     }
+                    // 时间片处理完成后，推进全局偏移，进入下一个片段。
                     h_idx += time_seq[time_k];
                 }
             } else {
+                // `time_seq` 为空时，说明当前帧没有可用于激光匹配的压缩点段。
+                // 此时系统退化为仅依靠 IMU 把状态推进到本帧时间范围内，避免状态完全停滞。
                 if (!imu_deque.empty()) {
                     imu_last = imu_next;
                     imu_next = *(imu_deque.front());
@@ -376,6 +417,8 @@ void LaserMapping::Run() {
                            imu_next.header.stamp.toSec() < meas.lidar_beg_time + lidar_time_inte) {
                         if (is_first_frame) {
                             {
+                                // 首帧且没有有效点云片段时，直接把 IMU 队列推进到当前帧时间窗口之后，
+                                // 不做正式更新，因为此时缺少可靠的激光约束来建立初始状态。
                                 while (imu_next.header.stamp.toSec() < meas.lidar_beg_time + lidar_time_inte) {
                                     imu_deque.pop_front();
                                     if (imu_deque.empty()) break;
@@ -397,6 +440,7 @@ void LaserMapping::Run() {
                         time_current = imu_next.header.stamp.toSec();
 
                         if (!is_first_frame) {
+                            // 在没有激光约束的情况下，仍按 IMU 时刻持续传播状态与协方差。
                             double dt = time_current - time_predict_last_const;
                             double dt_cov = time_current - time_update_last;
                             if (dt_cov > 0.0) {
@@ -407,6 +451,7 @@ void LaserMapping::Run() {
 
                             time_predict_last_const = time_current;
 
+                            // 用当前 IMU 做一次纯 IMU 迭代更新，保证姿态和偏置不会长时间失去约束。
                             angvel_avr << imu_next.angular_velocity.x, imu_next.angular_velocity.y, imu_next.angular_velocity.z;
                             acc_avr << imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z;
                             kf_output.update_iterated_dyn_share_IMU();
@@ -424,38 +469,52 @@ void LaserMapping::Run() {
                 }
             }
         } else {
+            // 该分支表示“IMU 作为系统显式输入量”，滤波器走 `kf_input`。
+            // 与上面的 `kf_output` 分支相比，这里会把 IMU 观测直接写入 `input_in`，
+            // 然后用输入驱动状态传播；激光仍然只在时间片边界执行一次匹配更新。
             bool imu_prop_cov = false;
             effct_feat_num = 0;
             if (time_seq.size() > 0) {
+                // 当前帧点云起始时间，后续每个时间片时刻都由“帧起始时间 + 点内偏移”得到。
                 double pcl_beg_time = meas.lidar_beg_time;
                 h_idx = -1;
                 for (time_k = 0; time_k < time_seq.size(); time_k++) {
+                    // 仍然取当前时间片最后一个点的时间，作为该片段统一对齐的目标时刻。
                     PointType &point_body = feats_down_body->points[h_idx + time_seq[time_k]];
                     time_current = point_body.curvature / 1000.0 + pcl_beg_time;
                     if (is_first_frame) {
+                        // 首帧先把 IMU 指针推进到不早于当前激光处理时刻的位置，
+                        // 防止刚开始传播就使用过旧的 IMU。
                         while (time_current > imu_next.header.stamp.toSec()) {
                             imu_deque.pop_front();
                             if (imu_deque.empty()) break;
                             imu_last = imu_next;
                             imu_next = *(imu_deque.front());
                         }
+                        // 初始化输入型滤波器的传播基准时刻。
                         imu_prop_cov = true;
                         is_first_frame = false;
                         t_last = time_current;
                         time_update_last = time_current;
+                        // 直接从 IMU 消息构造系统输入，并把加速度模长缩放到设定重力模长，
+                        // 减小传感器量纲或标定误差导致的长期漂移。
                         input_in.gyro << imu_last.angular_velocity.x, imu_last.angular_velocity.y, imu_last.angular_velocity.z;
                         input_in.acc << imu_last.linear_acceleration.x, imu_last.linear_acceleration.y, imu_last.linear_acceleration.z;
                         input_in.acc = input_in.acc * gravity_norm / acc_norm;
                     }
 
+                    // 只要当前时间片时刻已经超过下一条 IMU 时间戳，就持续消费 IMU。
                     while (time_current > imu_next.header.stamp.toSec()) {
                         imu_deque.pop_front();
 
+                        // 当前这一步传播使用的是 `imu_last` 对应的观测输入。
                         input_in.gyro << imu_last.angular_velocity.x, imu_last.angular_velocity.y, imu_last.angular_velocity.z;
                         input_in.acc << imu_last.linear_acceleration.x, imu_last.linear_acceleration.y, imu_last.linear_acceleration.z;
                         input_in.acc = input_in.acc * gravity_norm / acc_norm;
+                        // `t_last` 记录的是上一段已经完成传播的时刻，因此这里把状态推进到 `imu_last`。
                         double dt = imu_last.header.stamp.toSec() - t_last;
 
+                        // 与前一个分支类似：必要时先补协方差传播，再做状态传播。
                         double dt_cov = imu_last.header.stamp.toSec() - time_update_last;
                         if (dt_cov > 0.0) {
                             kf_input.predict(dt_cov, Q_input, input_in, false, true);
@@ -470,15 +529,18 @@ void LaserMapping::Run() {
                         imu_next = *(imu_deque.front());
                     }
 
+                    // 把状态从最近一次 IMU 时刻继续推进到当前激光时间片时刻。
                     double dt = time_current - t_last;
                     t_last = time_current;
                     if (!prop_at_freq_of_imu) {
+                        // 若不要求按 IMU 频率更新协方差，则在激光时间片边界统一补一次。
                         double dt_cov = time_current - time_update_last;
                         if (dt_cov > 0.0) {
                             kf_input.predict(dt_cov, Q_input, input_in, false, true);
                             time_update_last = time_current;
                         }
                     }
+                    // 完成到激光时间片末端的最终传播。
                     kf_input.predict(dt, Q_input, input_in, true, false);
 
                     if (feats_down_size < 1) {                        
@@ -486,6 +548,7 @@ void LaserMapping::Run() {
                         h_idx += time_seq[time_k];
                         continue;
                     }
+                    // 用当前状态执行一次激光匹配更新。
                     if (!kf_input.update_iterated_dyn_share_modified()) {
                         h_idx += time_seq[time_k];
                         continue;
@@ -495,6 +558,7 @@ void LaserMapping::Run() {
                         PublishOdometry(pub_odom_aft_mapped_);
                     }
 
+                    // 当前时间片配准完成后，把该片段内所有点变换到世界系。
                     for (int j = 0; j < time_seq[time_k]; ++j) {
                         PointType &point_body_j = feats_down_body->points[h_idx + j + 1];
                         PointType &point_world_j = feats_down_world->points[h_idx + j + 1];
@@ -503,6 +567,8 @@ void LaserMapping::Run() {
                     h_idx += time_seq[time_k];
                 }
             } else {
+                // 如果当前帧没有可参与匹配的时间片，则只维护 IMU 输入和时间推进，
+                // 防止滤波器状态在该帧完全冻结。
                 if (!imu_deque.empty()) {
                     imu_last = imu_next;
                     imu_next = *(imu_deque.front());
@@ -510,6 +576,7 @@ void LaserMapping::Run() {
                            imu_next.header.stamp.toSec() < meas.lidar_beg_time + lidar_time_inte) {
                         if (is_first_frame) {
                             {
+                                // 首帧且缺少有效激光片段时，仅快速跳过这一时间窗口内的 IMU。
                                 while (imu_next.header.stamp.toSec() < meas.lidar_beg_time + lidar_time_inte) {
                                     imu_deque.pop_front();
                                     if (imu_deque.empty()) break;
@@ -532,6 +599,8 @@ void LaserMapping::Run() {
                         time_current = imu_next.header.stamp.toSec();
 
                         if (!is_first_frame) {
+                            // 非首帧时，仍然维护时间基准和输入量，
+                            // 使下一次有激光约束时可以从正确的时刻继续传播。
                             double dt = time_current - t_last;
 
                             double dt_cov = time_current - time_update_last;
@@ -541,6 +610,7 @@ void LaserMapping::Run() {
 
                             t_last = imu_next.header.stamp.toSec();
 
+                            // 更新最近一条可用 IMU 输入，供后续真正的传播步骤继续使用。
                             input_in.gyro << imu_next.angular_velocity.x, imu_next.angular_velocity.y, imu_next.angular_velocity.z;
                             input_in.acc << imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z;
                             input_in.acc = input_in.acc * gravity_norm / acc_norm;
