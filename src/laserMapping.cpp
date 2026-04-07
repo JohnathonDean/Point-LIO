@@ -32,7 +32,11 @@ void LaserMapping::InitROS(ros::NodeHandle &nh) {
         },
         [this](state_output &s, esekfom::dyn_share_modified<double> &ekfom_data) {
             h_model_IMU_output(s, ekfom_data);
-        });
+        },
+        [this](state_output &s, esekfom::dyn_share_modified<double> &ekfom_data) {
+            h_model_odom_output(s, ekfom_data);
+        }
+    );
     Eigen::Matrix<double, 30, 30> P_init_output; // = MD(24, 24)::Identity() * 0.01;
     P_init_output = MD(30, 30)::Identity() * 0.01;
     P_init_output.block<3, 3>(21, 21) = MD(3,3)::Identity() * 0.0001;
@@ -67,6 +71,7 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     nh.param<int>("point_filter_num", point_filter_num, 2);
     nh.param<std::string>("common/lid_topic",lid_topic,"/livox/lidar");
     nh.param<std::string>("common/imu_topic", imu_topic,"/livox/imu");
+    nh.param<std::string>("common/wheel_odom_topic", wheel_odom_topic, "/wheel/odom");
     nh.param<bool>("common/cut_frame",cut_frame,false);
     nh.param<bool>("common/con_frame",con_frame,false);
     nh.param<int>("common/con_frame_num",con_frame_num,1);
@@ -87,6 +92,8 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     nh.param<double>("mapping/acc_cov_output",acc_cov_output,0.1);
     nh.param<std::vector<double>>("mapping/extrinsic_T", extrinT, std::vector<double>());
     nh.param<std::vector<double>>("mapping/extrinsic_R", extrinR, std::vector<double>());
+    nh.param<std::vector<double>>("mapping/base_extrinsic_T", base_extrinT, std::vector<double>());
+    nh.param<std::vector<double>>("mapping/base_extrinsic_R", base_extrinR, std::vector<double>());
     nh.param<std::vector<double>>("mapping/gravity", gravity, std::vector<double>());
     nh.param<std::vector<double>>("mapping/gravity_init", gravity_init, std::vector<double>());
     nh.param<double>("mapping/imu_meas_omg_cov", imu_meas_omg_cov, 0.1);
@@ -129,6 +136,9 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
     Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
 
+    Base_T_wrt_IMU<<VEC_FROM_ARRAY(base_extrinT);
+    Base_R_wrt_IMU<<MAT_FROM_ARRAY(base_extrinR);
+
     p_pre->lidar_type = lidar_type;
     p_pre->point_filter_num = point_filter_num;
     p_imu->imu_en = imu_en;
@@ -143,6 +153,7 @@ void LaserMapping::SubAndPubToROS(ros::NodeHandle &nh) {
         nh.subscribe(lid_topic, 200000, &LaserMapping::LivoxPclCallback, this) :
         nh.subscribe(lid_topic, 200000, &LaserMapping::StandardPclCallback, this);
     sub_imu_ = nh.subscribe(imu_topic, 200000, &LaserMapping::ImuCallback, this);
+    sub_wheel_odom_ = nh.subscribe(wheel_odom_topic, 200000, &LaserMapping::WheelOdomCallback, this);
 
     path_.header.stamp = ros::Time().now();
     path_.header.frame_id = "camera_init";
@@ -274,8 +285,8 @@ void LaserMapping::Run() {
             // 2. 在每个时间片处，把 IMU 队列推进到当前激光点对应时刻；
             // 3. 先做状态连续传播，再在合适时机做协方差传播和 IMU 约束更新；
             // 4. 用当前状态执行点到面匹配更新，再把该时间片里的点变换到世界系。
-            bool imu_upda_cov = false;
             effct_feat_num = 0;
+            std::size_t wheel_odom_idx = 0;
             if (time_seq.size() > 0) {
                 // `pcl_beg_time` 是当前这帧点云的起始时间。
                 // 后面每个点的真实时间 = 起始时间 + 点内相对时间（curvature 字段中编码，单位 ms）。
@@ -306,7 +317,6 @@ void LaserMapping::Run() {
                         }
                         // 首帧只做时间基准和状态基准的建立，不重复进入该初始化逻辑。
                         is_first_frame = false;
-                        imu_upda_cov = true;
                         // `time_update_last` 记录上一次进行协方差/测量更新的时刻；
                         // `time_predict_last_const` 记录上一次做连续状态传播的时刻。
                         time_update_last = time_current;
@@ -333,8 +343,41 @@ void LaserMapping::Run() {
 
                         // 只要当前处理时刻晚于 `imu_next`，说明这条 IMU 应当被纳入传播过程。
                         bool imu_comes = time_current > imu_next.header.stamp.toSec();
-                        while (imu_comes) {
-                            imu_upda_cov = true;
+                        while (imu_comes || wheel_odom_idx < meas.wheel_odom.size()) {
+                            const double next_imu_time =
+                                imu_comes ? imu_next.header.stamp.toSec() : std::numeric_limits<double>::infinity();
+                            const double next_wheel_odom_time =
+                                wheel_odom_idx < meas.wheel_odom.size() ?
+                                    meas.wheel_odom[wheel_odom_idx]->header.stamp.toSec() :
+                                    std::numeric_limits<double>::infinity();
+
+                            if (next_wheel_odom_time <= time_current && next_wheel_odom_time <= next_imu_time) {
+                                double dt = next_wheel_odom_time - time_predict_last_const;
+                                if (dt > 0.0) {
+                                    kf_output.predict(dt, Q_output, input_in, true, false);
+                                    time_predict_last_const = next_wheel_odom_time;
+                                }
+
+                                double dt_cov = next_wheel_odom_time - time_update_last;
+                                if (dt_cov > 0.0) {
+                                    time_update_last = next_wheel_odom_time;
+                                    kf_output.predict(dt_cov, Q_output, input_in, false, true);
+                                }
+
+                                const auto& wheel_odom_msg = meas.wheel_odom[wheel_odom_idx];
+                                odom_v << wheel_odom_msg->twist.twist.linear.x,
+                                          wheel_odom_msg->twist.twist.linear.y,
+                                          wheel_odom_msg->twist.twist.linear.z;
+                                kf_output.update_iterated_dyn_share_odom();
+                                wheel_odom_idx++;
+                                imu_comes = time_current > imu_next.header.stamp.toSec();
+                                continue;
+                            }
+
+                            if (!imu_comes) {
+                                break;
+                            }
+
                             // 用即将消费的这条 IMU 更新当前平均角速度/线加速度。
                             angvel_avr << imu_next.angular_velocity.x, imu_next.angular_velocity.y, imu_next.angular_velocity.z;
                             acc_avr << imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z;
@@ -362,6 +405,29 @@ void LaserMapping::Run() {
                             imu_next = *(imu_deque.front());
                             imu_comes = time_current > imu_next.header.stamp.toSec();
                         }
+                    }
+
+                    while (wheel_odom_idx < meas.wheel_odom.size() &&
+                           meas.wheel_odom[wheel_odom_idx]->header.stamp.toSec() <= time_current) {
+                        const double wheel_odom_time = meas.wheel_odom[wheel_odom_idx]->header.stamp.toSec();
+                        double dt = wheel_odom_time - time_predict_last_const;
+                        if (dt > 0.0) {
+                            kf_output.predict(dt, Q_output, input_in, true, false);
+                            time_predict_last_const = wheel_odom_time;
+                        }
+
+                        double dt_cov = wheel_odom_time - time_update_last;
+                        if (dt_cov > 0.0) {
+                            kf_output.predict(dt_cov, Q_output, input_in, false, true);
+                            time_update_last = wheel_odom_time;
+                        }
+
+                        const auto& wheel_odom_msg = meas.wheel_odom[wheel_odom_idx];
+                        odom_v << wheel_odom_msg->twist.twist.linear.x,
+                                  wheel_odom_msg->twist.twist.linear.y,
+                                  wheel_odom_msg->twist.twist.linear.z;
+                        kf_output.update_iterated_dyn_share_odom();
+                        wheel_odom_idx++;
                     }
 
                     // 把状态继续推进到当前激光时间片末端 `time_current`。
@@ -431,7 +497,6 @@ void LaserMapping::Run() {
                             angvel_avr << imu_last.angular_velocity.x, imu_last.angular_velocity.y, imu_last.angular_velocity.z;
                             acc_avr << imu_last.linear_acceleration.x, imu_last.linear_acceleration.y, imu_last.linear_acceleration.z;
 
-                            imu_upda_cov = true;
                             time_update_last = time_current;
                             time_predict_last_const = time_current;
 
@@ -647,15 +712,18 @@ void LaserMapping::Finish() {
 }
 
 bool LaserMapping::SyncPackages(MeasureGroup& meas) {
+    meas.imu.clear();
+    meas.wheel_odom.clear();
+
     if (!imu_en) {
         if (!lidar_buffer.empty()) {
             if (!lidar_pushed) {
                 meas.lidar = lidar_buffer.front();
                 meas.lidar_beg_time = time_buffer.front();
-                lose_lid = false;
+                lose_lidar = false;
                 if (meas.lidar->points.size() < 1) {
                     ROS_WARN("lose lidar");
-                    lose_lid = true;
+                    lose_lidar = true;
                 } else {
                     double end_time = meas.lidar->points.back().curvature;
                     for (auto pt: meas.lidar->points) {
@@ -667,10 +735,16 @@ bool LaserMapping::SyncPackages(MeasureGroup& meas) {
                 lidar_pushed = true;
             }
 
+            while (!wheel_odom_deque.empty() &&
+                   wheel_odom_deque.front()->header.stamp.toSec() < meas.lidar_last_time) {
+                meas.wheel_odom.emplace_back(wheel_odom_deque.front());
+                wheel_odom_deque.pop_front();
+            }
+
             time_buffer.pop_front();
             lidar_buffer.pop_front();
             lidar_pushed = false;
-            if (!lose_lid) {
+            if (!lose_lidar) {
                 return true;
             } else {
                 return false;
@@ -682,12 +756,12 @@ bool LaserMapping::SyncPackages(MeasureGroup& meas) {
     if (lidar_buffer.empty() || imu_deque.empty()) { return false; }
 
     if (!lidar_pushed) {
-        lose_lid = false;
+        lose_lidar = false;
         meas.lidar = lidar_buffer.front();
         meas.lidar_beg_time = time_buffer.front();
         if (meas.lidar->points.size() < 1) {
             ROS_WARN("lose lidar");
-            lose_lid = true;
+            lose_lidar = true;
             // lidar_buffer.pop_front();
             // time_buffer.pop_front();
             // return false;
@@ -703,10 +777,10 @@ bool LaserMapping::SyncPackages(MeasureGroup& meas) {
         lidar_pushed = true;
     }
 
-    if (!lose_lid && (last_timestamp_imu < lidar_end_time)) { return false; }
-    if (lose_lid && last_timestamp_imu < meas.lidar_beg_time + lidar_time_inte) { return false; }
+    if (!lose_lidar && (last_timestamp_imu < lidar_end_time)) { return false; }
+    if (lose_lidar && last_timestamp_imu < meas.lidar_beg_time + lidar_time_inte) { return false; }
 
-    if (!lose_lid && !imu_pushed) {
+    if (!lose_lidar && !imu_pushed) {
         /*** push imu data, and pop from imu buffer ***/
         if (p_imu->imu_need_init_) {
             double imu_time = imu_deque.front()->header.stamp.toSec();
@@ -724,7 +798,7 @@ bool LaserMapping::SyncPackages(MeasureGroup& meas) {
         imu_pushed = true;
     }
 
-    if (lose_lid && !imu_pushed) {
+    if (lose_lidar && !imu_pushed) {
         /*** push imu data, and pop from imu buffer ***/
         if (p_imu->imu_need_init_) {
             double imu_time = imu_deque.front()->header.stamp.toSec();
@@ -740,6 +814,13 @@ bool LaserMapping::SyncPackages(MeasureGroup& meas) {
             }
         }
         imu_pushed = true;
+    }
+
+    const double sync_end_time = lose_lidar ? (meas.lidar_beg_time + lidar_time_inte) : lidar_end_time;
+    while (!wheel_odom_deque.empty() &&
+           wheel_odom_deque.front()->header.stamp.toSec() < sync_end_time) {
+        meas.wheel_odom.emplace_back(wheel_odom_deque.front());
+        wheel_odom_deque.pop_front();
     }
 
     lidar_buffer.pop_front();
@@ -901,6 +982,19 @@ void LaserMapping::ImuCallback(const sensor_msgs::Imu::ConstPtr &msg_in) {
 
     imu_deque.emplace_back(msg);
     last_timestamp_imu = timestamp;
+}
+
+void LaserMapping::WheelOdomCallback(const nav_msgs::Odometry::ConstPtr &msg_in) {
+    nav_msgs::Odometry::Ptr msg(new nav_msgs::Odometry(*msg_in));
+    const double timestamp = msg->header.stamp.toSec();
+    if (timestamp < last_timestamp_wheel_odom) {
+        ROS_ERROR("wheel odom loop back, clear deque");
+        wheel_odom_deque.clear();
+        return;
+    }
+
+    wheel_odom_deque.emplace_back(msg);
+    last_timestamp_wheel_odom = timestamp;
 }
 
 void LaserMapping::PublishInitMap(const ros::Publisher &pub_laser_cloud_full_res) {
@@ -1100,6 +1194,13 @@ void LaserMapping::h_model_input(
     Eigen::Matrix3d cov_R,
     esekfom::dyn_share_modified<double>& ekfom_data
 ) {
+    // 激光观测模型:
+    // 对每个有效点，构造点到局部平面的标量残差
+    //   r = n^T * p_w + d
+    // 其中 n, d 由地图邻域点拟合得到，p_w 为当前状态下该点变换到世界系后的坐标。
+    // EKF 更新时使用的是 r 对状态的一阶线性化 Jacobian。
+    // 对当前时间片中的点逐个建立“点到局部平面”激光观测。
+    // 这一版对应 input-state EKF: IMU 原始测量作为输入，状态中不显式估计 omg/acc。
     VF(4) pabcd;
     pabcd.setZero();
     normvec->resize(time_seq[time_k]);
@@ -1112,12 +1213,14 @@ void LaserMapping::h_model_input(
         double p_norm = p_body.norm();
         {
             auto &points_near = nearest_points[h_idx + j + 1];
+            // 在地图中搜索该点的最近邻，用这些邻域点拟合局部平面。
             ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS);
             if (points_near.size() < NUM_MATCH_POINTS) {
                 point_selected_surf[h_idx + j + 1] = false;
             } else {
                 point_selected_surf[h_idx + j + 1] = false;
                 if (esti_plane(pabcd, points_near, static_cast<float>(plane_thr))) {
+                    // 点到平面距离足够小，且离雷达不能太近，才作为有效约束。
                     float pd2 = fabs(
                         pabcd(0) * point_world_j.x + pabcd(1) * point_world_j.y
                         + pabcd(2) * point_world_j.z + pabcd(3));
@@ -1138,6 +1241,7 @@ void LaserMapping::h_model_input(
         ekfom_data.valid = false;
         return;
     }
+    // 为所有有效点分配观测残差 z 和观测雅可比 h_x。
     ekfom_data.M_Noise = laser_point_cov;
     ekfom_data.h_x.resize(effect_num_k, 12);
     ekfom_data.h_x = Eigen::MatrixXd::Zero(effect_num_k, 12);
@@ -1149,6 +1253,7 @@ void LaserMapping::h_model_input(
             V3D norm_vec(normvec->points[j].x, normvec->points[j].y, normvec->points[j].z);
 
             if (extrinsic_est_en) {
+                // 线性化点到平面残差，对位姿和 LiDAR-IMU 外参同时求导。
                 V3D p_body = pbody_list[h_idx + j + 1];
                 M3D p_crossmat, p_imu_crossmat;
                 p_crossmat << SKEW_SYM_MATRX(p_body);
@@ -1157,17 +1262,25 @@ void LaserMapping::h_model_input(
                 V3D C(s.rot.transpose() * norm_vec);
                 V3D A(p_imu_crossmat * C);
                 V3D B(p_crossmat * s.offset_R_L_I.transpose() * C);
+                // h_x 这一行按顺序对应:
+                // 1. 平移偏导 n^T
+                // 2. 机体系姿态偏导 A
+                // 3. LiDAR-IMU 旋转外参偏导 B
+                // 4. LiDAR-IMU 平移外参偏导 C
                 ekfom_data.h_x.block<1, 12>(m, 0)
                     << norm_vec(0), norm_vec(1), norm_vec(2), VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B),
                     VEC_FROM_ARRAY(C);
             } else {
+                // 外参固定时，只保留状态位姿相关项。
                 M3D point_crossmat = crossmat_list[h_idx + j + 1];
                 V3D C(s.rot.transpose() * norm_vec);
                 V3D A(point_crossmat * C);
+                // 这里只估计主状态位姿，因此外参对应的 6 列全部置 0。
                 ekfom_data.h_x.block<1, 12>(m, 0)
                     << norm_vec(0), norm_vec(1), norm_vec(2), VEC_FROM_ARRAY(A),
                     0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
             }
+            // 点到平面的标量残差: n^T p + d。
             ekfom_data.z(m) =
                 -norm_vec(0) * feats_down_world->points[h_idx + j + 1].x
                 - norm_vec(1) * feats_down_world->points[h_idx + j + 1].y
@@ -1186,6 +1299,12 @@ void LaserMapping::h_model_output(
     Eigen::Matrix3d cov_R,
     esekfom::dyn_share_modified<double>& ekfom_data
 ) {
+    // 激光观测模型与 h_model_input 相同:
+    //   r = n^T * p_w + d
+    // 区别只在于这里线性化时所对应的滤波状态是 output-state 版本，
+    // 即系统把角速度/加速度本身也纳入状态估计。
+    // 与 h_model_input 相同，都是构造激光点到平面的观测模型；
+    // 区别仅在于这里服务于 output-state EKF，其余状态结构不同。
     VF(4) pabcd;
     pabcd.setZero();
     normvec->resize(time_seq[time_k]);
@@ -1198,6 +1317,7 @@ void LaserMapping::h_model_output(
         double p_norm = p_body.norm();
         {
             auto &points_near = nearest_points[h_idx + j + 1];
+            // 先做最近邻搜索和局部平面拟合，再决定这一点是否进入 EKF 更新。
             ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS);
 
             if (points_near.size() < NUM_MATCH_POINTS) {
@@ -1226,6 +1346,7 @@ void LaserMapping::h_model_output(
         return;
     }
 
+    // 只为通过筛选的有效点创建雅可比和残差，减少无效约束对求解的干扰。
     ekfom_data.M_Noise = laser_point_cov;
     ekfom_data.h_x.resize(effect_num_k, 12);
     ekfom_data.h_x = Eigen::MatrixXd::Zero(effect_num_k, 12);
@@ -1236,6 +1357,7 @@ void LaserMapping::h_model_output(
         if (point_selected_surf[h_idx + j + 1]) {
             V3D norm_vec(normvec->points[j].x, normvec->points[j].y, normvec->points[j].z);
             if (extrinsic_est_en) {
+                // 残差对状态位姿、以及 LiDAR-IMU 外参的导数。
                 V3D p_body = pbody_list[h_idx + j + 1];
                 M3D p_crossmat, p_imu_crossmat;
                 p_crossmat << SKEW_SYM_MATRX(p_body);
@@ -1244,16 +1366,23 @@ void LaserMapping::h_model_output(
                 V3D C(s.rot.transpose() * norm_vec);
                 V3D A(p_imu_crossmat * C);
                 V3D B(p_crossmat * s.offset_R_L_I.transpose() * C);
+                // A/B/C 是点到平面残差对不同变量的一阶近似项:
+                // A: 对当前姿态扰动的敏感度
+                // B: 对旋转外参扰动的敏感度
+                // C: 对平移外参扰动的敏感度
                 ekfom_data.h_x.block<1, 12>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2), VEC_FROM_ARRAY(A),
                     VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
             } else {
+                // 外参不估计时，外参相关列保持为 0。
                 M3D point_crossmat = crossmat_list[h_idx + j + 1];
                 V3D C(s.rot.transpose() * norm_vec);
                 V3D A(point_crossmat * C);
+                // 此时仅利用点对当前系统位姿的约束。
                 ekfom_data.h_x.block<1, 12>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2), VEC_FROM_ARRAY(A),
                     0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
             }
 
+            // 当前点相对于拟合平面的有符号距离，作为 EKF 的标量观测残差。
             ekfom_data.z(m) = -norm_vec(0) * feats_down_world->points[h_idx + j + 1].x
                             - norm_vec(1) * feats_down_world->points[h_idx + j + 1].y
                             - norm_vec(2) * feats_down_world->points[h_idx + j + 1].z
@@ -1265,13 +1394,24 @@ void LaserMapping::h_model_output(
 }
 
 void LaserMapping::h_model_IMU_output(state_output& s, esekfom::dyn_share_modified<double>& ekfom_data) {
+    // 6 维 IMU 观测对应: [gyro_x gyro_y gyro_z acc_x acc_y acc_z]。
+    // satu_check[i] = true 表示该通道接近饱和，本次更新时忽略这一维。
     std::memset(ekfom_data.satu_check, false, 6);
+
+    // 输出型状态把角速度/线加速度本身也作为待估计状态，
+    // 因此 IMU 残差直接写成: 测量值 - (状态量 + 偏置)。
     ekfom_data.z_IMU.block<3, 1>(0, 0) = angvel_avr - s.omg - s.bg;
+    // 加计测量先按配置重力模长做一次缩放，减小模长标定误差对更新的影响。
     ekfom_data.z_IMU.block<3, 1>(3, 0) = acc_avr * gravity_norm / acc_norm - s.acc - s.ba;
+    // 各轴独立观测噪声方差: 前 3 维陀螺，后 3 维加计。
     ekfom_data.R_IMU << imu_meas_omg_cov, imu_meas_omg_cov, imu_meas_omg_cov, imu_meas_acc_cov,
         imu_meas_acc_cov, imu_meas_acc_cov;
 
     if (check_satu) {
+        // 若某轴接近传感器满量程，则认为该通道不可靠:
+        // 1. 标记为 saturated
+        // 2. 将该维残差清零
+        // 后续 EKF 更新会跳过对应通道。
         if (fabs(angvel_avr(0)) >= 0.99 * satu_gyro) {
             ekfom_data.satu_check[0] = true;
             ekfom_data.z_IMU(0) = 0.0;
@@ -1297,4 +1437,36 @@ void LaserMapping::h_model_IMU_output(state_output& s, esekfom::dyn_share_modifi
             ekfom_data.z_IMU(5) = 0.0;
         }
     }
+}
+
+void LaserMapping::h_model_odom_output(state_output& s, esekfom::dyn_share_modified<double>& ekfom_data) {
+    // 轮速里程计观测模型:
+    //   z = v_odom - v_base_pred
+    //   v_base_pred = R_b_i * (R_i_w * v_w) - [R_b_i * omg]_x * t_b_i
+    // 前一项是 IMU 线速度投影到 base 系后的结果，
+    // 后一项是 IMU 与底盘原点存在杆臂时，由角速度产生的附加线速度。
+    // 轮速里程计提供的是底盘坐标系下的线速度观测。
+    // 这里把滤波器状态中的 IMU 角速度/线速度，通过 IMU->base 外参投影成可与 odom_v 比较的预测量。
+    const Eigen::Quaterniond base_Q_imu(Base_R_wrt_IMU);
+    const V3D& base_t_imu = Base_T_wrt_IMU;
+    const M3D rot_inv = M3D(s.rot).transpose();
+    const V3D vel_in_imu = rot_inv * s.vel;
+    ekfom_data.z_odom =
+        odom_v - (-skew_sym_mat(base_Q_imu * s.omg) * base_t_imu + base_Q_imu.toRotationMatrix() * vel_in_imu);
+
+    // 速度越大时，允许观测方差按比例放大，避免高速段对轮速过度信任。
+    ekfom_data.R_odom(0) = odom_v(0) * odom_v(0) * odom_vx_sig_scale * odom_vx_sig_scale + odom_vx_cov;
+    ekfom_data.R_odom(1) = odom_v(1) * odom_v(1) * odom_vy_sig_scale * odom_vy_sig_scale + odom_vy_cov;
+    // z 轴速度通常不由轮式底盘可靠观测，直接给极大噪声，相当于不约束该维。
+    ekfom_data.R_odom(2) = 1e10;
+
+    // h_odom 是线速度观测对输出型状态的雅可比。
+    // 这里主要保留姿态、线速度、角速度三部分的影响。
+    ekfom_data.h_odom = Eigen::Matrix<double, 3, 30>::Zero();
+    // 姿态变化会改变世界系速度投到 base 系后的结果。
+    ekfom_data.h_odom.block<3, 3>(0, 3) = base_Q_imu.toRotationMatrix() * skew_sym_mat(vel_in_imu); // R
+    // 线速度项是最直接的一阶映射。
+    ekfom_data.h_odom.block<3, 3>(0, 12) = base_Q_imu.toRotationMatrix() * rot_inv; // v
+    // 当 IMU 与底盘原点存在杆臂时，角速度会通过 v = w x r 影响底盘线速度。
+    ekfom_data.h_odom.block<3, 3>(0, 15) = skew_sym_mat(base_t_imu) * base_Q_imu.toRotationMatrix();  // omg
 }

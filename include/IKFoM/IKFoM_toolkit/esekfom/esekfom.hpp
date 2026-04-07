@@ -68,6 +68,9 @@ struct dyn_share_modified {
 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> h_x;
 	Eigen::Matrix<T, 6, 1> z_IMU;
 	Eigen::Matrix<T, 6, 1> R_IMU;
+	Eigen::Matrix<T, 3, 1> z_odom;
+	Eigen::Matrix<T, 3, 1> R_odom;
+	Eigen::Matrix<T, 3, 30> h_odom;
 	bool satu_check[6];
 };
 
@@ -118,13 +121,14 @@ public:
 	
 	void init_dyn_share_modified_3h(const processModel &f_in, const processMatrix1 &f_x_in,
 									const measurementModel_dyn_share_modified_cov &h_dyn_share_in1,
-									const measurementModel_dyn_share_modified &h_dyn_share_in2) {
+									const measurementModel_dyn_share_modified &h_dyn_share_in2,
+									const measurementModel_dyn_share_modified &h_dyn_share_in3) {
 		f = f_in;
 		f_x = f_x_in;
 		// f_w = f_w_in;
 		h_dyn_share_modified_1 = h_dyn_share_in1;
 		h_dyn_share_modified_2 = h_dyn_share_in2;
-		// h_dyn_share_modified_3 = h_dyn_share_in3;
+		h_dyn_share_modified_3 = h_dyn_share_in3;
 		maximum_iter = 1;
 		x_.build_S2_state();
 		x_.build_SO3_state();
@@ -235,7 +239,41 @@ public:
 		}
 		return true;
 	}
-	
+
+	bool update_iterated_dyn_share_odom() {
+        dyn_share_modified<scalar_type> dyn_share;
+        for (int i = 0; i < maximum_iter; i++) {
+            dyn_share.valid = true;
+            h_dyn_share_modified_3(x_, dyn_share);
+
+            if(! dyn_share.valid)
+				return false;
+			
+            // if (std::fabs(dyn_share.z_odom[0]) > 0.5 || std::fabs(dyn_share.z_odom[1]) > 0.5){
+			// 	return false;
+			// }
+
+            const auto &z   = dyn_share.z_odom;
+            const auto& h_x = dyn_share.h_odom;
+
+            Matrix<scalar_type, n, 3> PHT = P_ * h_x.transpose();
+            Matrix<scalar_type, 3, 3> HPHT = h_x * PHT;
+            HPHT(0, 0) += dyn_share.R_odom(0);
+            HPHT(1, 1) += dyn_share.R_odom(1);
+            HPHT(2, 2) += dyn_share.R_odom(2);
+
+            Matrix<scalar_type, n, 3> K_ = PHT * HPHT.inverse();
+
+            Matrix<scalar_type, n, 1> dx_ = K_ * z; 
+
+			x_.boxplus(dx_);
+			dyn_share.converge = true;
+
+            P_ -= K_ * h_x * P_;
+        }
+        return true;
+	}
+
 	void update_iterated_dyn_share_IMU() {
 		dyn_share_modified<scalar_type> dyn_share;
 		for(int i=0; i<maximum_iter; i++) {
@@ -271,7 +309,7 @@ public:
 		}
 		return;
 	}
-	
+
 	void change_x(state &input_state) {
 		x_ = input_state;
 		if((!x_.vect_state.size()) && (!x_.SO3_state.size()) &&

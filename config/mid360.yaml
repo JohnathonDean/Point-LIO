@@ -1,6 +1,7 @@
 common:
     lid_topic:  "/livox/lidar" 
     imu_topic:  "/livox/imu" 
+    wheel_odom_topic: ""
     con_frame: false # true: if you need to combine several LiDAR frames into one
     con_frame_num: 1 # the number of frames combined
     cut_frame: false # true: if you need to cut one LiDAR frame into several subframes
@@ -54,5 +55,4 @@ pcd_save:
     interval: -1                 # how many LiDAR frames saved in each pcd file; 
                                  # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
     dir: "/home/john/lio_ws/PCD/" # the directory to save pcd files, should end with "/"
-
 

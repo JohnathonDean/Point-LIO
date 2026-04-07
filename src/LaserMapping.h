@@ -55,6 +55,7 @@ class LaserMapping {
     void StandardPclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void LivoxPclCallback(const livox_ros_driver::CustomMsg::ConstPtr& msg);
     void ImuCallback(const sensor_msgs::Imu::ConstPtr& msg_in);
+    void WheelOdomCallback(const nav_msgs::Odometry::ConstPtr& msg_in);
 
   private:
     bool LoadParams(ros::NodeHandle& nh);
@@ -88,6 +89,7 @@ class LaserMapping {
         esekfom::dyn_share_modified<double>& ekfom_data
     );
     void h_model_IMU_output(state_output& s, esekfom::dyn_share_modified<double>& ekfom_data);
+    void h_model_odom_output(state_output& s, esekfom::dyn_share_modified<double>& ekfom_data);
 
   private:
     IVoxType::Options ivox_options_;
@@ -98,6 +100,7 @@ class LaserMapping {
     // ROS 通信对象：订阅原始传感器数据，发布建图结果。
     ros::Subscriber sub_pcl_;
     ros::Subscriber sub_imu_;
+    ros::Subscriber sub_wheel_odom_;
     ros::Publisher pub_laser_cloud_full_res_;
     ros::Publisher pub_laser_cloud_full_res_body_;
     ros::Publisher pub_laser_cloud_map_;
@@ -111,6 +114,7 @@ class LaserMapping {
     std::deque<PointCloudXYZI::Ptr>  lidar_buffer;
     std::deque<double>               time_buffer;
     std::deque<sensor_msgs::Imu::Ptr> imu_deque;
+    std::deque<nav_msgs::Odometry::Ptr> wheel_odom_deque;
     double last_timestamp_lidar = -1.0;
     int scan_count = 0;
     bool cut_frame_init = false; // true;
@@ -118,13 +122,14 @@ class LaserMapping {
     double time_con = 0.0;
     PointCloudXYZI::Ptr ptr_con = PointCloudXYZI::Ptr(new PointCloudXYZI());
     double last_timestamp_imu = -1.0;
+    double last_timestamp_wheel_odom = -1.0;
     double timediff_imu_wrt_lidar = 0.0;
     double time_lag_IMU_wtr_lidar = 0.0;
 
     // 同步后的当前处理组数据
     MeasureGroup meas;
     double lidar_end_time = 0.0;
-    bool lose_lid = false;
+    bool lose_lidar = false;
     bool lidar_pushed = false;
     bool imu_pushed = false;
     sensor_msgs::Imu imu_last;
@@ -177,6 +182,7 @@ class LaserMapping {
     Eigen::Matrix<double, 30, 30> Q_output;
     V3D angvel_avr = V3D::Zero();
     V3D acc_avr = V3D::Zero();
+    V3D odom_v = V3D::Zero();
 
 
 
@@ -185,6 +191,7 @@ class LaserMapping {
     int lidar_type;
     std::string lid_topic;
     std::string imu_topic;
+    std::string wheel_odom_topic;
     bool cut_frame = false;
     bool con_frame = false;
     int con_frame_num = 1;
@@ -205,6 +212,10 @@ class LaserMapping {
     M3D Lidar_R_wrt_IMU;
     std::vector<double> gravity_init;
     std::vector<double> gravity;
+    std::vector<double> base_extrinT{3, 0.0};
+    std::vector<double> base_extrinR{9, 0.0};
+    V3D Base_T_wrt_IMU;
+    M3D Base_R_wrt_IMU;
 
 	double gyr_cov_input;
 	double acc_cov_input;
@@ -215,6 +226,10 @@ class LaserMapping {
     double acc_cov_output;
     double imu_meas_omg_cov = 0.1;
     double imu_meas_acc_cov = 0.1;
+    double odom_vx_sig_scale = 0.1;
+    double odom_vy_sig_scale = 0.1;
+    double odom_vx_cov = 0.1;
+    double odom_vy_cov = 0.1;
     double satu_acc = 3.0;
     double satu_gyro = 35.0;
     double acc_norm = 1.0;

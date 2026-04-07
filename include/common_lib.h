@@ -9,6 +9,7 @@
 #include <pcl/point_cloud.h>
 #include <ros/ros.h>
 #include <sensor_msgs/Imu.h>
+#include <nav_msgs/Odometry.h>
 
 #include "IKFoM/IKFoM_toolkit/esekfom/esekfom.hpp"
 
@@ -209,6 +210,7 @@ struct MeasureGroup {
     double lidar_last_time;
     PointCloudXYZI::Ptr lidar;
     std::deque<sensor_msgs::Imu::ConstPtr> imu;
+    std::deque<nav_msgs::Odometry::ConstPtr> wheel_odom;
 };
 
 
